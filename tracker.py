@@ -478,10 +478,14 @@ def main() -> None:
         ("registration", registration_channel),
     ):
         if not 0 <= channel < n_channels:
-            raise IndexError(f"{name} channel {channel} is outside 0..{n_channels - 1}")
+            raise IndexError(
+                f"{name} channel {channel} is outside 0..{n_channels - 1}"
+            )
 
     track_tzyx = image.get_image_dask_data("TZYX", C=args.track_channel)
-    registration_tzyx = image.get_image_dask_data("TZYX", C=registration_channel)
+    registration_tzyx = image.get_image_dask_data(
+        "TZYX", C=registration_channel
+    )
     if int(track_tzyx.shape[0]) < 2:
         raise ValueError("Tracking requires at least two time points.")
 
@@ -582,7 +586,9 @@ def main() -> None:
     tracks_df, graph = tracker.to_tracks_layer()
     tracker.export_by_extension(str(output_dir / "tracks.csv"), overwrite=True)
     tracker.export_by_extension(str(output_dir / "tracks.xml"), overwrite=True)
-    tracker.export_by_extension(str(output_dir / "tracks_graph.json"), overwrite=True)
+    tracker.export_by_extension(
+        str(output_dir / "tracks_graph.json"), overwrite=True
+    )
     tracked_segments = tracker.to_zarr(
         store_or_path=str(output_dir / "tracked_segments.zarr"),
         overwrite=True,

@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """Stabilize a CZI timelapse, track neutrophils with Ultrack, and inspect in napari.
 
-Example
--------
-python fish_neutrophil_ultrack.py fish.czi --track-channel 1 --registration-channel 0
+Edit the USER SETTINGS block near the top of this file, then run:
 
-For a 3-D CZI, tracking is volumetric by default. Add ``--project-2d`` to
-track a maximum-intensity projection instead.
+    python fish_neutrophil_ultrack.py
+
+For a 3-D CZI, tracking is volumetric by default. Set ``PROJECT_2D = True``
+to track a maximum-intensity projection instead. Command-line parameters are
+not accepted.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
+import sys
 import warnings
 from pathlib import Path
 from typing import Any
@@ -31,103 +32,79 @@ from ultrack.imgproc import detect_foreground, robust_invert
 from ultrack.utils.array import array_apply, create_zarr
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Read a CZI timelapse, stabilize global XY shake, track bright "
-            "neutrophils with Ultrack, export results, and open napari."
-        )
-    )
-    parser.add_argument("czi", type=Path, help="Input .czi file")
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=None,
-        help="Output folder (default: <czi_stem>_ultrack next to the CZI)",
-    )
-    parser.add_argument("--scene", type=int, default=0, help="CZI scene index")
-    parser.add_argument(
-        "--track-channel",
-        type=int,
-        default=0,
-        help="Zero-based channel containing the neutrophils",
-    )
-    parser.add_argument(
-        "--registration-channel",
-        type=int,
-        default=None,
-        help=(
-            "Zero-based channel used to estimate shake. Prefer a stable fish/"
-            "brightfield channel. Default: the tracking channel"
-        ),
-    )
-    parser.add_argument(
-        "--project-2d",
-        action="store_true",
-        help="Track a Z maximum projection instead of the full 3-D volume",
-    )
-    parser.add_argument(
-        "--no-stabilization",
-        action="store_true",
-        help="Skip phase-correlation stabilization",
-    )
+# =============================================================================
+# USER SETTINGS — edit these values before running the script
+# =============================================================================
 
-    # Registration settings. These intentionally describe a simple global XY shift.
-    parser.add_argument("--registration-downsample", type=int, default=2)
-    parser.add_argument("--registration-sigma", type=float, default=4.0)
-    parser.add_argument("--registration-upsample", type=int, default=10)
-    parser.add_argument("--max-registration-shift", type=float, default=50.0)
+# Input and output
+CZI_PATH = Path("fish.czi")
+OUTPUT_DIR: Path | None = None  # None -> <CZI filename>_ultrack beside the CZI
 
-    # Classical foreground / contour generation for Ultrack.
-    parser.add_argument(
-        "--foreground-sigma",
-        type=float,
-        default=12.0,
-        help="Background-removal scale; choose larger than a neutrophil radius",
-    )
-    parser.add_argument("--boundary-sigma", type=float, default=1.5)
-    parser.add_argument(
-        "--min-foreground",
-        type=float,
-        default=0.0,
-        help="Optional absolute floor after background subtraction",
-    )
-    parser.add_argument(
-        "--keep-histogram-mode",
-        action="store_true",
-        help="Do not remove the dominant background histogram mode",
-    )
+# CZI selection and processing mode
+SCENE = 0
+TRACK_CHANNEL = 0
+REGISTRATION_CHANNEL: int | None = None  # None -> use TRACK_CHANNEL
+PROJECT_2D = False  # False tracks the full 3-D volume when Z has multiple planes
+NO_STABILIZATION = False
 
-    # Ultrack settings. Areas are pixels in 2-D and voxels in 3-D.
-    parser.add_argument("--min-area", type=int, default=20)
-    parser.add_argument("--max-area", type=int, default=20_000)
-    parser.add_argument(
-        "--max-distance",
-        type=float,
-        default=25.0,
-        help="Maximum frame-to-frame movement, measured in X-pixel units",
-    )
-    parser.add_argument("--max-neighbors", type=int, default=10)
-    parser.add_argument(
-        "--window-size",
-        type=int,
-        default=50,
-        help="Ultrack solver window; use 0 to solve the whole movie at once",
-    )
-    parser.add_argument("--overlap-size", type=int, default=5)
-    parser.add_argument(
-        "--solver",
-        choices=("auto", "GUROBI", "CBC"),
-        default="auto",
-        help="Ultrack integer-programming solver",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=max(1, min(8, (os.cpu_count() or 2) // 2)),
-    )
-    parser.add_argument("--tail-length", type=int, default=30)
-    return parser
+# Registration settings (simple global XY translation)
+REGISTRATION_DOWNSAMPLE = 2
+REGISTRATION_SIGMA = 4.0
+REGISTRATION_UPSAMPLE = 10
+MAX_REGISTRATION_SHIFT = 50.0
+
+# Classical foreground and contour generation for Ultrack
+FOREGROUND_SIGMA = 12.0  # Choose larger than a neutrophil radius
+BOUNDARY_SIGMA = 1.5
+MIN_FOREGROUND = 0.0
+KEEP_HISTOGRAM_MODE = False
+
+# Ultrack settings. Areas are pixels in 2-D and voxels in 3-D.
+MIN_AREA = 20
+MAX_AREA = 20_000
+MAX_DISTANCE = 25.0  # Maximum frame-to-frame movement in X-pixel units
+MAX_NEIGHBORS = 10
+WINDOW_SIZE = 50  # Set to 0 to solve the whole movie at once
+OVERLAP_SIZE = 5
+SOLVER = "auto"  # One of: "auto", "GUROBI", or "CBC"
+WORKERS = max(1, min(8, (os.cpu_count() or 2) // 2))
+TAIL_LENGTH = 30
+
+# =============================================================================
+# END USER SETTINGS
+# =============================================================================
+
+
+def validate_settings() -> None:
+    """Fail early when an editable setting has an invalid value."""
+    if SCENE < 0:
+        raise ValueError("SCENE must be zero or greater.")
+    if TRACK_CHANNEL < 0:
+        raise ValueError("TRACK_CHANNEL must be zero or greater.")
+    if REGISTRATION_CHANNEL is not None and REGISTRATION_CHANNEL < 0:
+        raise ValueError("REGISTRATION_CHANNEL must be None or zero or greater.")
+    if REGISTRATION_DOWNSAMPLE < 1:
+        raise ValueError("REGISTRATION_DOWNSAMPLE must be at least 1.")
+    if REGISTRATION_UPSAMPLE < 1:
+        raise ValueError("REGISTRATION_UPSAMPLE must be at least 1.")
+    if MAX_REGISTRATION_SHIFT <= 0:
+        raise ValueError("MAX_REGISTRATION_SHIFT must be positive.")
+    if MIN_AREA < 0 or MAX_AREA < MIN_AREA:
+        raise ValueError("Require 0 <= MIN_AREA <= MAX_AREA.")
+    if MAX_DISTANCE <= 0:
+        raise ValueError("MAX_DISTANCE must be positive.")
+    if MAX_NEIGHBORS < 1:
+        raise ValueError("MAX_NEIGHBORS must be at least 1.")
+    if WINDOW_SIZE < 0:
+        raise ValueError("WINDOW_SIZE must be zero or greater.")
+    if OVERLAP_SIZE < 0:
+        raise ValueError("OVERLAP_SIZE must be zero or greater.")
+    if SOLVER not in {"auto", "GUROBI", "CBC"}:
+        raise ValueError('SOLVER must be "auto", "GUROBI", or "CBC".')
+    if WORKERS < 1:
+        raise ValueError("WORKERS must be at least 1.")
+    if TAIL_LENGTH < 0:
+        raise ValueError("TAIL_LENGTH must be zero or greater.")
 
 
 def _compute(array: Any) -> np.ndarray:
@@ -223,7 +200,7 @@ def estimate_xy_shifts(
                 raise ValueError("non-finite phase-correlation shift")
             if np.linalg.norm(shift_full) > max_shift_px:
                 raise ValueError(
-                    f"estimated shift {shift_full} exceeds --max-registration-shift"
+                    f"estimated shift {shift_full} exceeds MAX_REGISTRATION_SHIFT"
                 )
             if not np.isfinite(error):
                 warnings.warn(f"Frame {t}: phase-correlation error is non-finite")
@@ -324,33 +301,40 @@ def generate_ultrack_inputs(
 
 
 def make_ultrack_config(
-    args: argparse.Namespace,
     *,
     working_dir: Path,
     n_time: int,
+    workers: int,
+    min_area: int,
+    max_area: int,
+    max_distance: float,
+    max_neighbors: int,
+    solver: str,
+    window_size: int,
+    overlap_size: int,
 ) -> MainConfig:
     config = MainConfig()
     config.data_config.working_dir = working_dir
-    config.data_config.n_workers = args.workers
+    config.data_config.n_workers = workers
 
-    config.segmentation_config.n_workers = args.workers
-    config.segmentation_config.min_area = args.min_area
-    config.segmentation_config.max_area = args.max_area
+    config.segmentation_config.n_workers = workers
+    config.segmentation_config.min_area = min_area
+    config.segmentation_config.max_area = max_area
     config.segmentation_config.min_frontier = 0.0
 
-    config.linking_config.n_workers = args.workers
-    config.linking_config.max_distance = args.max_distance
-    config.linking_config.max_neighbors = args.max_neighbors
+    config.linking_config.n_workers = workers
+    config.linking_config.max_distance = max_distance
+    config.linking_config.max_neighbors = max_neighbors
 
-    config.tracking_config.solver_name = "" if args.solver == "auto" else args.solver
-    config.tracking_config.n_threads = args.workers
+    config.tracking_config.solver_name = "" if solver == "auto" else solver
+    config.tracking_config.n_threads = workers
     # Neutrophils normally do not divide during a short movie.
     config.tracking_config.division_weight = -0.1
 
-    if args.window_size > 0 and n_time > args.window_size:
-        config.tracking_config.window_size = args.window_size
+    if window_size > 0 and n_time > window_size:
+        config.tracking_config.window_size = window_size
         config.tracking_config.overlap_size = min(
-            args.overlap_size, max(1, args.window_size // 2)
+            overlap_size, max(1, window_size // 2)
         )
 
     return config
@@ -443,30 +427,29 @@ def open_results_in_napari(
 
 
 def main() -> None:
-    args = build_parser().parse_args()
-    args.czi = args.czi.expanduser().resolve()
-    if not args.czi.is_file():
-        raise FileNotFoundError(args.czi)
-    if args.czi.suffix.lower() != ".czi":
-        warnings.warn(f"Expected a .czi file, received: {args.czi.name}")
+    validate_settings()
+
+    czi_path = Path(CZI_PATH).expanduser().resolve()
+    if not czi_path.is_file():
+        raise FileNotFoundError(czi_path)
+    if czi_path.suffix.lower() != ".czi":
+        warnings.warn(f"Expected a .czi file, received: {czi_path.name}")
 
     output_dir = (
-        args.output.expanduser().resolve()
-        if args.output is not None
-        else args.czi.with_name(f"{args.czi.stem}_ultrack")
+        Path(OUTPUT_DIR).expanduser().resolve()
+        if OUTPUT_DIR is not None
+        else czi_path.with_name(f"{czi_path.stem}_ultrack")
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     work_dir = output_dir / "ultrack_work"
     work_dir.mkdir(parents=True, exist_ok=True)
 
     registration_channel = (
-        args.track_channel
-        if args.registration_channel is None
-        else args.registration_channel
+        TRACK_CHANNEL if REGISTRATION_CHANNEL is None else REGISTRATION_CHANNEL
     )
 
-    image = BioImage(str(args.czi), reconstruct_mosaic=True)
-    image.set_scene(args.scene)
+    image = BioImage(str(czi_path), reconstruct_mosaic=True)
+    image.set_scene(SCENE)
     print(f"Scenes: {image.scenes}")
     print(f"Selected scene: {image.current_scene}")
     print(f"Scene dimensions: {image.dims}")
@@ -474,7 +457,7 @@ def main() -> None:
 
     n_channels = int(image.dims.C)
     for name, channel in (
-        ("track", args.track_channel),
+        ("track", TRACK_CHANNEL),
         ("registration", registration_channel),
     ):
         if not 0 <= channel < n_channels:
@@ -482,7 +465,7 @@ def main() -> None:
                 f"{name} channel {channel} is outside 0..{n_channels - 1}"
             )
 
-    track_tzyx = image.get_image_dask_data("TZYX", C=args.track_channel)
+    track_tzyx = image.get_image_dask_data("TZYX", C=TRACK_CHANNEL)
     registration_tzyx = image.get_image_dask_data(
         "TZYX", C=registration_channel
     )
@@ -490,7 +473,7 @@ def main() -> None:
         raise ValueError("Tracking requires at least two time points.")
 
     z_count = int(track_tzyx.shape[1])
-    is_3d = (not args.project_2d) and z_count > 1
+    is_3d = (not PROJECT_2D) and z_count > 1
     if is_3d:
         movie = track_tzyx
     elif z_count == 1:
@@ -504,15 +487,15 @@ def main() -> None:
     else:
         registration_projection = registration_tzyx.max(axis=1)
 
-    if args.no_stabilization:
+    if NO_STABILIZATION:
         shifts_yx = np.zeros((int(movie.shape[0]), 2), dtype=float)
     else:
         shifts_yx = estimate_xy_shifts(
             registration_projection,
-            downsample=args.registration_downsample,
-            sigma=args.registration_sigma,
-            upsample_factor=args.registration_upsample,
-            max_shift_px=args.max_registration_shift,
+            downsample=REGISTRATION_DOWNSAMPLE,
+            sigma=REGISTRATION_SIGMA,
+            upsample_factor=REGISTRATION_UPSAMPLE,
+            max_shift_px=MAX_REGISTRATION_SHIFT,
         )
 
     pd.DataFrame(
@@ -533,7 +516,7 @@ def main() -> None:
     # When a separate structural/brightfield channel was used for registration,
     # stabilize it with the identical shifts so the fish is visible under the tracks.
     stabilized_context = None
-    if registration_channel != args.track_channel:
+    if registration_channel != TRACK_CHANNEL:
         if is_3d:
             context_movie = registration_tzyx
         elif int(registration_tzyx.shape[1]) == 1:
@@ -553,7 +536,7 @@ def main() -> None:
     pixel_z = _positive_float(pixel_sizes.Z, pixel_x)
 
     # Ultrack's link distance is measured after this scaling. Normalizing by X
-    # keeps --max-distance interpretable as approximately X pixels while still
+    # keeps MAX_DISTANCE interpretable as approximately X pixels while still
     # accounting for anisotropic Z/Y sampling.
     if is_3d:
         spatial_scale = (pixel_z / pixel_x, pixel_y / pixel_x, 1.0)
@@ -566,14 +549,23 @@ def main() -> None:
         stabilized,
         output_dir=output_dir,
         spatial_scale=spatial_scale,
-        foreground_sigma=args.foreground_sigma,
-        boundary_sigma=args.boundary_sigma,
-        min_foreground=args.min_foreground,
-        remove_hist_mode=not args.keep_histogram_mode,
+        foreground_sigma=FOREGROUND_SIGMA,
+        boundary_sigma=BOUNDARY_SIGMA,
+        min_foreground=MIN_FOREGROUND,
+        remove_hist_mode=not KEEP_HISTOGRAM_MODE,
     )
 
     config = make_ultrack_config(
-        args, working_dir=work_dir, n_time=int(stabilized.shape[0])
+        working_dir=work_dir,
+        n_time=int(stabilized.shape[0]),
+        workers=WORKERS,
+        min_area=MIN_AREA,
+        max_area=MAX_AREA,
+        max_distance=MAX_DISTANCE,
+        max_neighbors=MAX_NEIGHBORS,
+        solver=SOLVER,
+        window_size=WINDOW_SIZE,
+        overlap_size=OVERLAP_SIZE,
     )
     tracker = Tracker(config)
     tracker.track(
@@ -594,13 +586,35 @@ def main() -> None:
         overwrite=True,
     )
 
-    parameters = vars(args).copy()
-    parameters["czi"] = str(args.czi)
-    parameters["output"] = str(output_dir)
-    parameters["registration_channel"] = registration_channel
-    parameters["is_3d"] = is_3d
-    parameters["spatial_scale"] = spatial_scale
-    parameters["physical_pixel_sizes_zyx"] = (pixel_z, pixel_y, pixel_x)
+    parameters = {
+        "czi": str(czi_path),
+        "output": str(output_dir),
+        "scene": SCENE,
+        "track_channel": TRACK_CHANNEL,
+        "registration_channel": registration_channel,
+        "project_2d": PROJECT_2D,
+        "no_stabilization": NO_STABILIZATION,
+        "registration_downsample": REGISTRATION_DOWNSAMPLE,
+        "registration_sigma": REGISTRATION_SIGMA,
+        "registration_upsample": REGISTRATION_UPSAMPLE,
+        "max_registration_shift": MAX_REGISTRATION_SHIFT,
+        "foreground_sigma": FOREGROUND_SIGMA,
+        "boundary_sigma": BOUNDARY_SIGMA,
+        "min_foreground": MIN_FOREGROUND,
+        "keep_histogram_mode": KEEP_HISTOGRAM_MODE,
+        "min_area": MIN_AREA,
+        "max_area": MAX_AREA,
+        "max_distance": MAX_DISTANCE,
+        "max_neighbors": MAX_NEIGHBORS,
+        "window_size": WINDOW_SIZE,
+        "overlap_size": OVERLAP_SIZE,
+        "solver": SOLVER,
+        "workers": WORKERS,
+        "tail_length": TAIL_LENGTH,
+        "is_3d": is_3d,
+        "spatial_scale": spatial_scale,
+        "physical_pixel_sizes_zyx": (pixel_z, pixel_y, pixel_x),
+    }
     with open(output_dir / "run_parameters.json", "w", encoding="utf-8") as stream:
         json.dump(parameters, stream, indent=2)
 
@@ -618,10 +632,15 @@ def main() -> None:
         graph=graph,
         napari_scale=napari_scale,
         is_3d=is_3d,
-        tail_length=args.tail_length,
-        title=f"{args.czi.name} — Ultrack neutrophils",
+        tail_length=TAIL_LENGTH,
+        title=f"{czi_path.name} — Ultrack neutrophils",
     )
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        raise SystemExit(
+            "This script does not accept command-line parameters. "
+            "Edit the USER SETTINGS block at the top of the file instead."
+        )
     main()

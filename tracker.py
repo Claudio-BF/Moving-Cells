@@ -1,19 +1,46 @@
 #!/usr/bin/env python3
-"""Stabilize a CZI timelapse, track neutrophils with Ultrack, and inspect in napari.
+"""Stabilize a CZI timelapse, segment neutrophils in 3D by Cellpose-SAM stitching,
+track with Ultrack, inspect in napari.
 
-Edit the USER SETTINGS block near the top of this file, then run:
+The 2D->3D step is plain Cellpose-style stitching, using the Cellpose-SAM
+("cpsam") model:
 
-    python fish_neutrophil_ultrack.py
+    1. Keep the full Z-stack (no projection).
+    2. Estimate XY camera shake and apply the SAME shift to every Z slice.
+    3. Segment each Z slice independently in 2D with Cellpose-SAM.
+    4. Stitch the per-slice 2D masks into 3D by matching them along Z on
+       intersection-over-union (IoU) -- the same idea as Cellpose's
+       ``stitch_threshold``, with one addition: a label may be reconnected
+       across a short Z gap (see STITCH_MAX_Z_GAP).
+    5. Convert the 3D labels to Ultrack foreground/contours and track in 3D.
 
-For a 3-D CZI, tracking is volumetric by default. Set ``PROJECT_2D = True``
-to track a maximum-intensity projection instead. Command-line parameters are
-not accepted.
+Because labels are propagated by 2D-mask overlap (not by 3D connectivity),
+horizontal separation and Z-gap bridging are independent knobs:
+
+  * Horizontal separation is decided entirely by the 2D Cellpose masks. Two cells
+    that touch in XY but are separate 2D objects stay separate all the way up the
+    stack. Tune this with the CELLPOSE_* knobs (cellprob, flow).
+  * Z-gap bridging is decided by STITCH_MAX_Z_GAP, which lets a label survive a
+    few empty slices and re-match by IoU. Matching is per-object, so bridging a
+    gap never merges neighbours in XY.
+
+So: if cells merge side-to-side, fix it in 2D (Cellpose); if a cell breaks into
+two along Z, raise STITCH_MAX_Z_GAP.
+
+Edit the USER SETTINGS block, then run:
+
+    python tracker.py
+
+Set TIME_SUBSET to a single frame index to segment just one frame (fast) and skip
+tracking, or to a (start, stop) pair to run the full pipeline on only that
+inclusive range of frames. Command-line parameters are not accepted.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
-import os
+import logging
 import sys
 import warnings
 from pathlib import Path
@@ -25,11 +52,24 @@ import numpy as np
 import pandas as pd
 from bioio import BioImage
 from scipy import ndimage as ndi
+from skimage.measure import regionprops_table
 from skimage.registration import phase_cross_correlation
 from tqdm.auto import tqdm
 from ultrack import MainConfig, Tracker
-from ultrack.imgproc import detect_foreground, robust_invert
-from ultrack.utils.array import array_apply, create_zarr
+from ultrack.utils import labels_to_contours
+from ultrack.utils.array import create_zarr
+
+
+# Silence two scikit-image >= 0.26 FutureWarnings raised from inside Ultrack
+# (remove_small_objects(min_size=...) and RegionProperties.intensity_image, the
+# pre-0.26 spellings). They come from the installed Ultrack package, not this
+# script; drop this block once Ultrack adopts the >= 0.26 API.
+warnings.filterwarnings(
+    "ignore", category=FutureWarning, message=r".*min_size.*deprecat",
+)
+warnings.filterwarnings(
+    "ignore", category=FutureWarning, message=r".*intensity_image.*deprecat",
+)
 
 
 # =============================================================================
@@ -37,76 +77,185 @@ from ultrack.utils.array import array_apply, create_zarr
 # =============================================================================
 
 # Input and output
-CZI_PATH = Path("fish.czi")
-OUTPUT_DIR: Path | None = None  # None -> <CZI filename>_ultrack beside the CZI
+CZI_PATH = Path("/mnt/d/JerisonServer/Eric/Lightfield demo/2026-03-27-mpx-r848-dss-7dpf/processed/Z-subsets/Bath-5.czi")
+OUTPUT_DIR: Path | None = Path("data")  # None -> <CZI filename>_ultrack beside the CZI
 
 # CZI selection and processing mode
 SCENE = 0
 TRACK_CHANNEL = 0
 REGISTRATION_CHANNEL: int | None = None  # None -> use TRACK_CHANNEL
-PROJECT_2D = False  # False tracks the full 3-D volume when Z has multiple planes
 NO_STABILIZATION = False
 
-# Registration settings (simple global XY translation)
+# Time-point selection / quick-test mode.
+#   None             -> process the whole movie and track.
+#   an int N         -> process ONLY frame N (stabilize, segment, stitch, show in
+#                       napari) and skip tracking. Use this to tune Cellpose +
+#                       stitching quickly on a single frame.
+#   a (start, stop)  -> process only frames start..stop INCLUSIVE and run the full
+#                       pipeline (tracking included) on that slice. For example
+#                       (10, 60) processes the 51 frames 10 through 60. A length-1
+#                       slice behaves exactly like the single-frame case above.
+# Reported frame numbers (napari titles, run_parameters.json) use the original
+# absolute indices; the arrays are re-indexed from 0 within the slice.
+TIME_SUBSET: int | tuple[int, int] | None = None
+
+# Registration settings (simple global XY translation).
 REGISTRATION_DOWNSAMPLE = 2
 REGISTRATION_SIGMA = 4.0
 REGISTRATION_UPSAMPLE = 10
 MAX_REGISTRATION_SHIFT = 50.0
 
-# Classical foreground and contour generation for Ultrack
-FOREGROUND_SIGMA = 12.0  # Choose larger than a neutrophil radius
-BOUNDARY_SIGMA = 1.5
-MIN_FOREGROUND = 0.0
-KEEP_HISTOGRAM_MODE = False
+# -- 2D per-slice segmentation (Cellpose-SAM / "cpsam") --
+# Cellpose-SAM runs once per Z slice. It is a channel-agnostic, largely
+# size-invariant generalist trained on ROI diameters from ~7.5 to 120 px
+# (mean 30), so it needs no channel selection and no diameter estimate to
+# segment these small neutrophils out of the box.
+#
+# >>> To reduce HORIZONTAL (XY) merging of touching cells, in rough order of
+#     effectiveness:
+#       - raise CELLPOSE_CELLPROB_THRESHOLD (e.g. 0.5–3.0): shrinks masks, so
+#         touching cells separate;
+#       - lower CELLPOSE_FLOW_THRESHOLD (e.g. 0.3): drops poorly-formed masks;
+#       - raise NORM_HIGH_PERCENTILE toward 99.999.
+CELLPOSE_MODEL = "cpsam"           # built-in Cellpose-SAM, or a path to a fine-tuned model
+CELLPOSE_GPU = True
+CELLPOSE_FLOW_THRESHOLD = 1.3
+CELLPOSE_CELLPROB_THRESHOLD = 1.3  # raise (e.g. 1.0–3.0) to drop weaker detections
+# Number of image patches run on the GPU at once. cpsam uses the memory-heavy
+# SAM-ViT-L backbone, so its default is small: raise it on a large-VRAM GPU for
+# speed, or lower it if you hit a CUDA out-of-memory error.
+CELLPOSE_BATCH_SIZE = 8
+# Optional size hint. None keeps native resolution and is recommended here: these
+# ~7 px cells sit right at the floor of cpsam's trained range (7.5–120 px), so it
+# should handle them without rescaling. Setting a value rescales toward cpsam's
+# 30 px mean: below 30 upsamples (recovers missed tiny cells, but is much slower);
+# above 30 downsamples big cells (faster).
+CELLPOSE_DIAMETER: float | None = 5
 
-# Ultrack settings. Areas are pixels in 2-D and voxels in 3-D.
-MIN_AREA = 20
-MAX_AREA = 20_000
-MAX_DISTANCE = 25.0  # Maximum frame-to-frame movement in X-pixel units
-MAX_NEIGHBORS = 10
-WINDOW_SIZE = 50  # Set to 0 to solve the whole movie at once
+# -- 2D -> 3D stitching --
+# Two adjacent-slice 2D masks are joined into one 3D object when their IoU is at
+# least STITCH_IOU_THRESHOLD (this is Cellpose's `stitch_threshold`). Lower it if
+# a cell that clearly continues up the stack is being split into separate labels;
+# raise it if two distinct cells stacked along Z are being fused.
+STITCH_IOU_THRESHOLD = 0.25
+# Maximum number of CONSECUTIVE empty Z slices a label may jump across and still
+# be reconnected to its earlier appearance. 0 = Cellpose's behaviour (adjacent
+# slices only). 1 bridges a single-slice dropout, which is what you asked for.
+# This bridges gaps WITHOUT any XY dilation, so it cannot cause horizontal merges.
+STITCH_MAX_Z_GAP = 2
+
+# -- Brightness handling (separates bright neutrophils from the dim fish) --
+#   - Raise NORM_LOW_PERCENTILE to suppress more of the fish (more aggressive).
+#   - Lower it if real neutrophils are being missed.
+#   - Raise NORM_HIGH_PERCENTILE toward 99.999 if touching neutrophils merge.
+NORM_LOW_PERCENTILE = 99.0
+NORM_HIGH_PERCENTILE = 99.9999
+NORM_SAMPLE_FRAMES = 8  # frames sampled across time to estimate the global window
+# Discard any 2D object whose mean (globally-normalized) brightness is below this
+# floor, removing dim fish regions that slipped through. 0 disables the gate.
+MIN_CELL_NORM_INTENSITY = 0.1
+
+# -- Per-slice size + shape filter (runs on each Z slice's 2D Cellpose masks) --
+# After the dim-object gate above, every 2D object on a slice is checked and
+# dropped before stitching if it is the wrong SIZE or not roughly circular, so a
+# malformed detection never reaches the 3D objects or the tracker.
+#   * SIZE: an object is removed when its 2D pixel area is < MIN_AREA or
+#     > MAX_AREA -- the SAME bounds Ultrack uses for its 3D segments (defined in
+#     the "ultrack.segmentation" block below). They are REUSED here as 2D pixel
+#     areas: for these ~6-7 px neutrophils a mid-cell cross-section is ~30-40 px,
+#     so the [MIN_AREA, MAX_AREA] band keeps whole cells while dropping single-
+#     pixel slivers and over-large merged/hazy blobs. (This also trims the tiny
+#     top/bottom cross-sections of a cell, but STITCH_MAX_Z_GAP can bridge that.)
+#   * SHAPE: circularity is judged by ECCENTRICITY of the equivalent ellipse:
+#     0 = a perfect circle, ->1 = a straight line. It is derived from image
+#     moments, so it stays reliable on the small pixelated masks here -- unlike
+#     the perimeter-based form factor 4*pi*area/perimeter^2, whose perimeter is
+#     badly estimated at this object size. An object with eccentricity above
+#     SLICE_MAX_ECCENTRICITY is dropped; 0.85 rejects anything longer than ~1.9:1,
+#     which mostly catches two cells merged side by side. Set it to 1.0 to skip
+#     the shape check entirely.
+#   * OPTIONAL extra shape gate: SOLIDITY (area / convex-hull area; 1.0 = convex)
+#     catches ragged or pinched masks that are not elongated. It is OFF by default
+#     (0.0) because rasterization pushes small but legitimate cross-sections down
+#     toward ~0.85; raise it (e.g. 0.9) to also drop concave/lumpy blobs.
+# Set SLICE_FILTER_ENABLED = False to disable the whole per-slice filter.
+SLICE_FILTER_ENABLED = True
+SLICE_MAX_ECCENTRICITY = 0.88  # 0 = circle, ->1 = line; 1.0 disables the check
+SLICE_MIN_SOLIDITY = 0.0       # area/convex area; 0.0 disables; try 0.9 to enable
+
+# -- Ultrack contour generation from the 3D labels --
+CONTOUR_SIGMA = 1.0  # Gaussian smoothing of label boundaries in labels_to_contours
+
+# Ultrack settings.
+
+# -- ultrack.data --
+DATA_WORKERS = 4
+
+# -- ultrack.segmentation --
+MIN_AREA = 12        # 3D voxels
+MAX_AREA = 60       # 3D voxels
+MIN_AREA_FACTOR = 2.0
+MIN_FRONTIER = 0.08
+SEG_THRESHOLD = 0.3
+MAX_NOISE = 0.0
+ANISOTROPY_PENALIZATION = 0.0  # >0 penalizes hypotheses that grow across Z
+SEG_RANDOM_SEED: int | str = "frame"
+SEG_WORKERS = 8
+
+# -- ultrack.linking --
+# >>> THESE TWO SETTINGS GOVERN "HUGE JUMPS" <<<
+#   MAX_DISTANCE is a HARD CAP: two detections more than this many (x-scaled)
+#     pixels apart in consecutive frames are NEVER linked. This is the knob that
+#     stops Ultrack from stitching a far-away cell onto a track.
+#   DISTANCE_WEIGHT is the SOFT PENALTY: each candidate link's cost grows by
+#     DISTANCE_WEIGHT * distance, so among allowed links the solver prefers the
+#     shortest. Raise it to penalize long-but-legal jumps harder.
+# Cells here move ~3-5 px/frame, so the cap is set to ~3x that (15). If huge jumps
+# persist, lower MAX_DISTANCE toward 10-12 and/or raise DISTANCE_WEIGHT further.
+MAX_DISTANCE = 10.0     # hard cap on frame-to-frame movement (x-pixel units)
+MAX_NEIGHBORS = 8
+DISTANCE_WEIGHT = 0.01  # penalize longer links (soft cost ~ weight * distance)
+LINK_Z_SCORE_THRESHOLD = 7.0
+LINK_WORKERS = 8
+
+# -- ultrack.tracking (ILP solver) --
+SOLVER = "GUROBI"  # One of: "auto", "GUROBI", or "CBC"
+APPEAR_WEIGHT = -0.0015
+DISAPPEAR_WEIGHT = -0.0015
+DIVISION_WEIGHT = -0.05
+TRACKING_THREADS = 4
+SOLUTION_GAP = 0.001
+TIME_LIMIT = 36000  # seconds
+TRACKING_METHOD = 0
+LINK_FUNCTION = "power"  # One of: "power", "identity"
+POWER = 4.0
+BIAS = 0.0
+
+# Temporal windowing. WINDOW_SIZE = 0 solves the whole movie at once.
+WINDOW_SIZE = 0
 OVERLAP_SIZE = 5
-SOLVER = "auto"  # One of: "auto", "GUROBI", or "CBC"
-WORKERS = max(1, min(8, (os.cpu_count() or 2) // 2))
-TAIL_LENGTH = 30
+
+# -- Post-tracking track filtering (applied after solving, before export) --
+# Remove finished tracks AND erase their cells from the segmentation when a
+# track is either too short or barely moves:
+#   * present in fewer than MIN_TRACK_LENGTH frames, or
+#   * mean per-frame centroid step below MIN_MEAN_SPEED voxels/frame (raw z,y,x
+#     voxel distance). Cells here crawl ~3-5 voxels/frame, so 2 keeps movers and
+#     drops near-stationary debris.
+MIN_TRACK_LENGTH = 5    # frames
+MIN_MEAN_SPEED = 0.0    # voxels per frame
+
+# napari trajectory tail length (display only).
+TAIL_LENGTH = 15
 
 # =============================================================================
 # END USER SETTINGS
 # =============================================================================
 
 
-def validate_settings() -> None:
-    """Fail early when an editable setting has an invalid value."""
-    if SCENE < 0:
-        raise ValueError("SCENE must be zero or greater.")
-    if TRACK_CHANNEL < 0:
-        raise ValueError("TRACK_CHANNEL must be zero or greater.")
-    if REGISTRATION_CHANNEL is not None and REGISTRATION_CHANNEL < 0:
-        raise ValueError("REGISTRATION_CHANNEL must be None or zero or greater.")
-    if REGISTRATION_DOWNSAMPLE < 1:
-        raise ValueError("REGISTRATION_DOWNSAMPLE must be at least 1.")
-    if REGISTRATION_UPSAMPLE < 1:
-        raise ValueError("REGISTRATION_UPSAMPLE must be at least 1.")
-    if MAX_REGISTRATION_SHIFT <= 0:
-        raise ValueError("MAX_REGISTRATION_SHIFT must be positive.")
-    if MIN_AREA < 0 or MAX_AREA < MIN_AREA:
-        raise ValueError("Require 0 <= MIN_AREA <= MAX_AREA.")
-    if MAX_DISTANCE <= 0:
-        raise ValueError("MAX_DISTANCE must be positive.")
-    if MAX_NEIGHBORS < 1:
-        raise ValueError("MAX_NEIGHBORS must be at least 1.")
-    if WINDOW_SIZE < 0:
-        raise ValueError("WINDOW_SIZE must be zero or greater.")
-    if OVERLAP_SIZE < 0:
-        raise ValueError("OVERLAP_SIZE must be zero or greater.")
-    if SOLVER not in {"auto", "GUROBI", "CBC"}:
-        raise ValueError('SOLVER must be "auto", "GUROBI", or "CBC".')
-    if WORKERS < 1:
-        raise ValueError("WORKERS must be at least 1.")
-    if TAIL_LENGTH < 0:
-        raise ValueError("TAIL_LENGTH must be zero or greater.")
-
-
+# ---------------------------------------------------------------------------
+# Small array helpers
+# ---------------------------------------------------------------------------
 def _compute(array: Any) -> np.ndarray:
     """Convert a NumPy/Dask/Zarr slice to a NumPy array."""
     if hasattr(array, "compute"):
@@ -114,25 +263,99 @@ def _compute(array: Any) -> np.ndarray:
     return np.asarray(array)
 
 
+def _positive_labels(array: np.ndarray) -> np.ndarray:
+    """Return the sorted non-zero (foreground) label ids in ``array``."""
+    ids = np.unique(array)
+    return ids[ids > 0]
+
+
 def _positive_float(value: Any, fallback: float) -> float:
     try:
         value = float(value)
     except (TypeError, ValueError):
         return fallback
-    if not np.isfinite(value) or value <= 0:
-        return fallback
-    return value
+    return value if np.isfinite(value) and value > 0 else fallback
+
+
+def _as_dask(array: Any) -> da.Array:
+    """Wrap a zarr/NumPy array as a dask array (avoids da.from_zarr quirks)."""
+    if isinstance(array, da.Array):
+        return array
+    chunks = getattr(array, "chunks", None) or "auto"
+    return da.from_array(array, chunks=chunks)
+
+
+def _label_layer(array: Any) -> Any:
+    """Return a napari-friendly integer array for an add_labels layer."""
+    layer = _as_dask(array)
+    return layer.astype(np.uint8) if layer.dtype == bool else layer
+
+
+def _new_zarr(shape: Any, dtype: Any, path: Path) -> Any:
+    """Create a disk-backed (over)writable Zarr of the given shape and dtype."""
+    return create_zarr(
+        shape=tuple(int(v) for v in shape),
+        dtype=dtype, store_or_path=str(path), overwrite=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Environment / logging helpers
+# ---------------------------------------------------------------------------
+def _silence_cellpose_seed_warnings() -> None:
+    """Quiet Cellpose's per-slice "no seeds found ... no masks found" logging.
+
+    Cellpose logs it at WARNING from ``cellpose.dynamics`` once per empty Z slice
+    -- tens of thousands of identical lines on a big stack. Raising only that
+    logger to ERROR silences them without touching any other Cellpose message.
+    Call this AFTER the model is constructed so Cellpose's own logging setup does
+    not reset it.
+    """
+    logging.getLogger("cellpose.dynamics").setLevel(logging.ERROR)
+
+
+def _check_gpu_imgproc_stack() -> None:
+    """Fail fast when Ultrack will use the GPU for image processing but cuCIM is absent.
+
+    Ultrack's imgproc helpers (notably ``labels_to_contours``) move each frame to
+    the GPU whenever CuPy is importable and then call ``cucim.skimage``. With CuPy
+    but no cuCIM they hand a CuPy array to CPU scikit-image and crash -- and only
+    AFTER segmentation finishes. Checking here turns a multi-hour-then-crash into
+    an instant, actionable error. No-ops when CuPy is missing (Ultrack stays on
+    the CPU).
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("cupy") is None:
+        return  # No CuPy -> Ultrack runs imgproc on CPU -> cuCIM not required.
+
+    try:
+        import cucim.skimage  # noqa: F401  # the exact module Ultrack uses on GPU
+    except Exception as exc:  # missing, or a broken cuCIM/CuPy/CUDA install
+        raise ImportError(
+            "CuPy is installed but cuCIM is not importable, so Ultrack's "
+            "labels_to_contours step will move data to the GPU and then crash "
+            "(TypeError: Implicit conversion to a NumPy array is not allowed). "
+            "Install the cuCIM build matching your CuPy/CUDA major version into "
+            "this environment, e.g. `pip install cucim-cu12` (CUDA 12.x) or "
+            "`pip install cucim-cu11` (CUDA 11.x). To run on the CPU instead, "
+            "uninstall CuPy or delete this check."
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# XY stabilization (camera shake only; biology is untouched)
+# ---------------------------------------------------------------------------
+def _project_to_2d(tzyx: da.Array) -> da.Array:
+    """Collapse Z to a 2D (TYX) movie for registration estimation only."""
+    return tzyx[:, 0] if int(tzyx.shape[1]) == 1 else tzyx.max(axis=1)
 
 
 def _prepare_registration_frame(
-    frame_yx: np.ndarray,
-    *,
-    downsample: int,
-    sigma: float,
+    frame_yx: np.ndarray, *, downsample: int, sigma: float
 ) -> np.ndarray:
-    """Normalize, blur, crop, and downsample one 2-D registration frame."""
-    frame = np.asarray(frame_yx, dtype=np.float32)
-    frame = np.nan_to_num(frame, copy=False)
+    """Normalize, blur, crop, and downsample one 2D registration frame."""
+    frame = np.nan_to_num(np.asarray(frame_yx, dtype=np.float32), copy=False)
 
     low, high = np.percentile(frame, (1.0, 99.8))
     if high <= low:
@@ -142,11 +365,10 @@ def _prepare_registration_frame(
     if sigma > 0:
         frame = ndi.gaussian_filter(frame, sigma=sigma)
 
-    # Ignore a narrow border, which is often less stable and causes wrap ambiguity.
-    border_y = int(round(frame.shape[0] * 0.04))
-    border_x = int(round(frame.shape[1] * 0.04))
-    if border_y > 0 and border_x > 0:
-        cropped = frame[border_y:-border_y, border_x:-border_x]
+    # Ignore a narrow border, which is less stable and causes wrap ambiguity.
+    by, bx = (int(round(s * 0.04)) for s in frame.shape)
+    if by > 0 and bx > 0:
+        cropped = frame[by:-by, bx:-bx]
         if min(cropped.shape) >= 32:
             frame = cropped
 
@@ -162,7 +384,7 @@ def _prepare_registration_frame(
 
 
 def estimate_xy_shifts(
-    registration_ty_x: da.Array,
+    registration_tyx: da.Array,
     *,
     downsample: int,
     sigma: float,
@@ -171,264 +393,754 @@ def estimate_xy_shifts(
 ) -> np.ndarray:
     """Estimate the absolute XY shift required to stabilize every frame.
 
-    Each raw frame is aligned to the previously stabilized frame. Only translation
-    is modeled; rotation, deformation, and biological cell movement are untouched.
+    Each raw frame is aligned to the previously stabilized frame by phase
+    correlation. Only translation is modeled.
     """
-    n_time = int(registration_ty_x.shape[0])
+    n_time = int(registration_tyx.shape[0])
     shifts = np.zeros((n_time, 2), dtype=np.float64)
+    ds = max(1, int(downsample))
 
-    previous_registered = _prepare_registration_frame(
-        _compute(registration_ty_x[0]), downsample=downsample, sigma=sigma
+    previous = _prepare_registration_frame(
+        _compute(registration_tyx[0]), downsample=ds, sigma=sigma
     )
 
     for t in tqdm(range(1, n_time), desc="Estimating XY stabilization"):
         current = _prepare_registration_frame(
-            _compute(registration_ty_x[t]), downsample=downsample, sigma=sigma
+            _compute(registration_tyx[t]), downsample=ds, sigma=sigma
         )
         try:
             shift_small, error, _ = phase_cross_correlation(
-                previous_registered,
-                current,
-                upsample_factor=max(1, int(upsample_factor)),
+                previous, current, upsample_factor=max(1, int(upsample_factor)),
                 normalization=None,
             )
-            shift_full = np.asarray(shift_small[-2:], dtype=float) * max(
-                1, int(downsample)
-            )
-
+            shift_full = np.asarray(shift_small[-2:], dtype=float) * ds
             if not np.all(np.isfinite(shift_full)):
                 raise ValueError("non-finite phase-correlation shift")
             if np.linalg.norm(shift_full) > max_shift_px:
-                raise ValueError(
-                    f"estimated shift {shift_full} exceeds MAX_REGISTRATION_SHIFT"
-                )
+                raise ValueError(f"shift {shift_full} exceeds MAX_REGISTRATION_SHIFT")
             if not np.isfinite(error):
                 warnings.warn(f"Frame {t}: phase-correlation error is non-finite")
-
         except Exception as exc:  # keep the pipeline usable on a low-contrast frame
-            warnings.warn(
-                f"Frame {t}: registration failed ({exc}); reusing the preceding shift"
-            )
+            warnings.warn(f"Frame {t}: registration failed ({exc}); reusing last shift")
             shift_full = shifts[t - 1]
 
         shifts[t] = shift_full
-        previous_registered = ndi.shift(
-            current,
-            shift=tuple(shift_full / max(1, int(downsample))),
-            order=1,
-            mode="constant",
-            cval=0.0,
-            prefilter=False,
+        previous = ndi.shift(
+            current, shift=tuple(shift_full / ds), order=1,
+            mode="constant", cval=0.0, prefilter=False,
         )
 
     return shifts
 
 
-def write_stabilized_movie(
-    movie: da.Array,
+def write_stabilized_volume(
+    volume_tzyx: da.Array,
     shifts_yx: np.ndarray,
     output_path: Path,
     *,
-    description: str = "Writing stabilized movie",
+    description: str = "Writing stabilized volume",
 ) -> Any:
-    """Apply XY shifts frame-by-frame and write a disk-backed Zarr array."""
-    output = create_zarr(
-        shape=tuple(int(v) for v in movie.shape),
-        dtype=np.float32,
-        store_or_path=str(output_path),
-        overwrite=True,
-    )
-
-    for t in tqdm(range(int(movie.shape[0])), desc=description):
-        frame = _compute(movie[t]).astype(np.float32, copy=False)
+    """Apply the per-frame XY shift to every Z slice and write a disk-backed Zarr."""
+    output = _new_zarr(volume_tzyx.shape, np.float32, output_path)
+    for t in tqdm(range(int(volume_tzyx.shape[0])), desc=description):
+        volume = _compute(volume_tzyx[t]).astype(np.float32, copy=False)  # (Z, Y, X)
         dy, dx = shifts_yx[t]
-        spatial_shift = (dy, dx) if frame.ndim == 2 else (0.0, dy, dx)
-        finite = frame[np.isfinite(frame)]
+        finite = volume[np.isfinite(volume)]
         cval = float(np.percentile(finite, 1.0)) if finite.size else 0.0
         output[t] = ndi.shift(
-            frame,
-            shift=spatial_shift,
-            order=1,
-            mode="constant",
-            cval=cval,
-            prefilter=False,
+            volume, shift=(0.0, dy, dx), order=1,
+            mode="constant", cval=cval, prefilter=False,
         )
-
     return output
 
 
-def generate_ultrack_inputs(
+# ---------------------------------------------------------------------------
+# Global intensity window (keeps the dim fish dark)
+# ---------------------------------------------------------------------------
+def estimate_intensity_bounds(
+    volume_tzyx: Any, *, low_percentile: float, high_percentile: float,
+    sample_frames: int,
+) -> tuple[float, float]:
+    """Estimate one global intensity window from frames sampled across time."""
+    n_time = int(volume_tzyx.shape[0])
+    count = max(1, min(n_time, int(sample_frames)))
+    frame_idx = np.unique(np.linspace(0, n_time - 1, count).round().astype(int))
+
+    rng = np.random.default_rng(0)
+    pooled: list[np.ndarray] = []
+    for t in frame_idx:
+        values = _compute(volume_tzyx[t]).astype(np.float32, copy=False).ravel()
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            continue
+        if values.size > 1_000_000:  # cap memory; a sample is enough for percentiles
+            values = rng.choice(values, 1_000_000, replace=False)
+        pooled.append(values)
+
+    if not pooled:
+        return 0.0, 1.0
+
+    everything = np.concatenate(pooled)
+    low = float(np.percentile(everything, low_percentile))
+    high = float(np.percentile(everything, high_percentile))
+    if not np.isfinite(low):
+        low = 0.0
+    if not np.isfinite(high) or high <= low:
+        high = low + 1.0
+    return low, high
+
+
+def _drop_dim_objects(
+    mask: np.ndarray, intensity: np.ndarray, min_mean: float
+) -> np.ndarray:
+    """Zero out labels whose mean normalized intensity is below ``min_mean``."""
+    ids = _positive_labels(mask)
+    if ids.size == 0:
+        return mask
+    means = np.asarray(ndi.mean(intensity, labels=mask, index=ids), dtype=float)
+    dim = ids[means < min_mean]
+    if dim.size:
+        mask = mask.copy()
+        mask[np.isin(mask, dim)] = 0
+    return mask
+
+
+def _filter_slice_objects(
+    mask: np.ndarray,
+    *,
+    min_area: float,
+    max_area: float,
+    max_eccentricity: float,
+    min_solidity: float,
+) -> np.ndarray:
+    """Zero out 2D objects on one Z slice that are the wrong size or not circular.
+
+    Runs on a single slice's label image (after the dim-object gate) before
+    stitching. An object is removed when ANY of these hold:
+
+      * pixel ``area`` < ``min_area`` or > ``max_area`` -- Ultrack's MIN_AREA /
+        MAX_AREA reused as 2D pixel-area bounds;
+      * ``eccentricity`` > ``max_eccentricity`` (0 = circle, ->1 = line), which
+        drops elongated masks such as two cells merged side by side. Skipped when
+        ``max_eccentricity`` >= 1;
+      * ``solidity`` < ``min_solidity`` (area / convex-hull area; 1 = convex),
+        which drops ragged or pinched masks. Skipped when ``min_solidity`` <= 0.
+
+    The size gate is applied first with a fast bincount, and the moment-/hull-based
+    shape metrics are measured only on the objects that pass it -- both to save
+    work and to keep the convex hull off degenerate slivers. ``eccentricity`` and
+    ``solidity`` come from image moments and the convex hull, which stay meaningful
+    on the small pixelated blobs here; the perimeter-based circularity
+    ``4*pi*area/perimeter**2`` is deliberately avoided because its perimeter term
+    is unreliable at this object size.
+    """
+    if mask.max() == 0:
+        return mask
+
+    # --- size gate: reuse MIN_AREA / MAX_AREA as 2D pixel-area bounds ---
+    counts = np.bincount(mask.ravel())
+    counts[0] = 0  # ignore background
+    bad_size = np.nonzero((counts > 0) & ((counts < min_area) | (counts > max_area)))[0]
+
+    out = mask
+    if bad_size.size:
+        out = mask.copy()
+        out[np.isin(mask, bad_size)] = 0
+        if out.max() == 0:
+            return out
+
+    # --- shape gate: measured only on the size-passing objects ---
+    check_ecc = max_eccentricity < 1.0
+    check_sol = min_solidity > 0.0
+    if not (check_ecc or check_sol):
+        return out
+
+    props: tuple[str, ...] = ("label",)
+    if check_ecc:
+        props += ("eccentricity",)
+    if check_sol:
+        props += ("solidity",)
+    table = regionprops_table(out, properties=props)
+
+    bad = np.zeros(table["label"].shape, dtype=bool)
+    if check_ecc:
+        bad |= np.asarray(table["eccentricity"], dtype=float) > max_eccentricity
+    if check_sol:
+        bad |= np.asarray(table["solidity"], dtype=float) < min_solidity
+
+    drop = table["label"][bad]
+    if drop.size:
+        out = out if out is not mask else mask.copy()
+        out[np.isin(out, drop)] = 0
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 2D -> 3D stitching (Cellpose-style IoU, with a Z-gap tolerance)
+# ---------------------------------------------------------------------------
+def _iou(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """IoU between every labelled object in ``a`` and every object in ``b``.
+
+    Returns ``(iou, a_ids, b_ids)`` where ``iou[i, j]`` is the IoU of label
+    ``a_ids[i]`` with ``b_ids[j]``. Computed from a joint histogram, so cost is
+    O(pixels), not O(objects**2 * pixels).
+    """
+    a_ids = _positive_labels(a)
+    b_ids = _positive_labels(b)
+    if a_ids.size == 0 or b_ids.size == 0:
+        return np.zeros((a_ids.size, b_ids.size), np.float64), a_ids, b_ids
+
+    both = (a > 0) & (b > 0)
+    ai = np.searchsorted(a_ids, a[both])
+    bi = np.searchsorted(b_ids, b[both])
+    inter = np.zeros((a_ids.size, b_ids.size), dtype=np.int64)
+    np.add.at(inter, (ai, bi), 1)
+
+    area_a = np.bincount(a.ravel(), minlength=int(a_ids.max()) + 1)[a_ids]
+    area_b = np.bincount(b.ravel(), minlength=int(b_ids.max()) + 1)[b_ids]
+    union = area_a[:, None] + area_b[None, :] - inter
+    return inter / np.maximum(union, 1), a_ids, b_ids
+
+
+def stitch_gap(
+    masks_zyx: np.ndarray, *, iou_threshold: float, max_gap: int
+) -> np.ndarray:
+    """Stitch a stack of 2D label images into 3D, bridging up to ``max_gap`` gaps.
+
+    Walking up Z, each slice's 2D objects are matched against the most recent
+    appearance of every still-active label by IoU. A matched object inherits the
+    label; an unmatched object starts a new one. A label whose last appearance was
+    up to ``max_gap`` empty slices ago is still eligible, which reconnects a cell
+    that dropped out on an intermediate slice.
+
+    Because matching is per-object on the 2D masks (never on a dilated/merged
+    foreground), two cells that touch in XY but are distinct 2D objects are kept
+    separate, and each reference label can be claimed by at most one object per
+    slice -- so gap bridging cannot cause horizontal merging. With ``max_gap == 0``
+    this reduces to Cellpose's ``stitch3D``.
+    """
+    masks_zyx = np.asarray(masks_zyx)
+    n_z = masks_zyx.shape[0]
+    out = np.zeros_like(masks_zyx, dtype=np.int32)
+
+    ref = np.zeros(masks_zyx.shape[1:], dtype=np.int32)  # carried-forward labels
+    age: dict[int, int] = {}                             # label -> slices since last seen
+    next_label = 1
+
+    for z in range(n_z):
+        cur = masks_zyx[z]
+        cur_ids = _positive_labels(cur)
+        seen: set[int] = set()
+
+        if cur_ids.size:
+            assigned: dict[int, int] = {}
+
+            if age:  # try to inherit a label from a recent slice
+                iou, _, ref_present = _iou(cur, ref)
+                if ref_present.size:
+                    best = iou.argmax(axis=1)
+                    best_iou = iou.max(axis=1)
+                    holder: set[int] = set()
+                    # Greedy: strongest overlaps first; each ref label taken once.
+                    for k in np.argsort(-best_iou):
+                        if float(best_iou[k]) < iou_threshold:
+                            break
+                        rlab = int(ref_present[best[k]])
+                        if rlab in holder:
+                            continue
+                        assigned[int(cur_ids[k])] = rlab
+                        holder.add(rlab)
+
+            lut = np.zeros(int(cur.max()) + 1, dtype=np.int32)
+            for cid in cur_ids.tolist():
+                if cid not in assigned:
+                    assigned[cid] = next_label
+                    next_label += 1
+                lut[cid] = assigned[cid]
+            out[z] = lut[cur]
+            seen = set(assigned.values())
+
+        # Carry forward labels that are absent this slice but still young enough.
+        keep = np.array(
+            [lab for lab, a in age.items() if lab not in seen and a + 1 <= max_gap],
+            dtype=np.int64,
+        )
+        new_ref = np.where(np.isin(ref, keep), ref, 0) if keep.size else np.zeros_like(ref)
+        present = out[z] > 0
+        new_ref[present] = out[z][present]  # most-recent appearance wins on overlap
+
+        age = {int(lab): age[int(lab)] + 1 for lab in keep.tolist()}
+        age.update(dict.fromkeys(seen, 0))
+        ref = new_ref
+
+    return out
+
+
+def segment_and_stitch(
     stabilized: Any,
     *,
-    output_dir: Path,
-    spatial_scale: tuple[float, ...],
-    foreground_sigma: float,
-    boundary_sigma: float,
-    min_foreground: float,
-    remove_hist_mode: bool,
-) -> tuple[Any, Any]:
-    """Create Ultrack foreground and contour maps on disk."""
-    foreground = create_zarr(
-        shape=stabilized.shape,
-        dtype=bool,
-        store_or_path=str(output_dir / "foreground.zarr"),
-        overwrite=True,
-    )
-    array_apply(
-        stabilized,
-        out_array=foreground,
-        func=detect_foreground,
-        voxel_size=spatial_scale,
-        sigma=foreground_sigma,
-        remove_hist_mode=remove_hist_mode,
-        min_foreground=min_foreground,
-    )
+    output_path: Path,
+    pretrained_model: str,
+    diameter: float | None,
+    gpu: bool,
+    batch_size: int,
+    flow_threshold: float,
+    cellprob_threshold: float,
+    norm_low: float,
+    norm_high: float,
+    min_cell_norm_intensity: float,
+    slice_filter: bool,
+    slice_min_area: float,
+    slice_max_area: float,
+    slice_max_eccentricity: float,
+    slice_min_solidity: float,
+    iou_threshold: float,
+    max_gap: int,
+) -> Any:
+    """Segment every Z slice in 2D with Cellpose-SAM, then stitch into 3D labels.
 
-    contours = create_zarr(
-        shape=stabilized.shape,
-        dtype=np.float16,
-        store_or_path=str(output_dir / "contours.zarr"),
-        overwrite=True,
-    )
-    array_apply(
-        stabilized,
-        out_array=contours,
-        func=robust_invert,
-        voxel_size=spatial_scale,
-        sigma=boundary_sigma,
-    )
-    return foreground, contours
+    Each slice is normalized with the SAME global window so dim fish stays dark
+    (Cellpose's own normalization is disabled). On every slice, objects dimmer
+    than ``min_cell_norm_intensity`` are dropped and then -- when ``slice_filter``
+    is set -- objects outside ``[slice_min_area, slice_max_area]`` pixels or less
+    circular than the ``slice_max_eccentricity`` / ``slice_min_solidity`` bounds
+    are removed (see ``_filter_slice_objects``), all before stitching. Produces a
+    (T, Z, Y, X) Zarr of 3D instance labels.
+    """
+    try:
+        from cellpose import models
+    except ImportError as exc:  # pragma: no cover - dependency guard
+        raise ImportError(
+            "Cellpose-SAM is required: `pip install 'cellpose>=4'`."
+        ) from exc
 
+    # Cellpose 4 removed the models.Cellpose wrapper; CellposeModel loads the
+    # Cellpose-SAM ("cpsam") weights by default, or a fine-tuned model by path.
+    model = models.CellposeModel(gpu=gpu, pretrained_model=pretrained_model)
+    _silence_cellpose_seed_warnings()  # after model construction; see the helper
 
-def make_ultrack_config(
-    *,
-    working_dir: Path,
-    n_time: int,
-    workers: int,
-    min_area: int,
-    max_area: int,
-    max_distance: float,
-    max_neighbors: int,
-    solver: str,
-    window_size: int,
-    overlap_size: int,
-) -> MainConfig:
-    config = MainConfig()
-    config.data_config.working_dir = working_dir
-    config.data_config.n_workers = workers
+    n_time = int(stabilized.shape[0])
+    n_z = int(stabilized.shape[1])
+    span = float(norm_high - norm_low) or 1.0
+    labels = _new_zarr(stabilized.shape, np.int32, output_path)
 
-    config.segmentation_config.n_workers = workers
-    config.segmentation_config.min_area = min_area
-    config.segmentation_config.max_area = max_area
-    config.segmentation_config.min_frontier = 0.0
+    for t in tqdm(range(n_time), desc="Cellpose 2D + Z-stitch"):
+        volume = _compute(stabilized[t]).astype(np.float32, copy=False)  # (Z, Y, X)
+        normalized = np.clip((volume - norm_low) / span, 0.0, 1.0)
 
-    config.linking_config.n_workers = workers
-    config.linking_config.max_distance = max_distance
-    config.linking_config.max_neighbors = max_neighbors
+        # One eval over the whole stack (Cellpose batches the slices internally).
+        # cpsam takes no channels argument, and with diameter=None it segments at
+        # native resolution -- both are handled inside the model.
+        masks = model.eval(
+            [normalized[z] for z in range(n_z)],
+            diameter=diameter,
+            flow_threshold=flow_threshold, cellprob_threshold=cellprob_threshold,
+            normalize=False,  # already globally normalized above
+            batch_size=batch_size,
+        )[0]
 
-    config.tracking_config.solver_name = "" if solver == "auto" else solver
-    config.tracking_config.n_threads = workers
-    # Neutrophils normally do not divide during a short movie.
-    config.tracking_config.division_weight = -0.1
+        slices = []
+        for z in range(n_z):
+            mask = np.asarray(masks[z], dtype=np.int32)
+            if min_cell_norm_intensity > 0 and mask.max() > 0:
+                mask = _drop_dim_objects(mask, normalized[z], min_cell_norm_intensity)
+            if slice_filter and mask.max() > 0:
+                mask = _filter_slice_objects(
+                    mask,
+                    min_area=slice_min_area, max_area=slice_max_area,
+                    max_eccentricity=slice_max_eccentricity,
+                    min_solidity=slice_min_solidity,
+                )
+            slices.append(mask)
 
-    if window_size > 0 and n_time > window_size:
-        config.tracking_config.window_size = window_size
-        config.tracking_config.overlap_size = min(
-            overlap_size, max(1, window_size // 2)
+        labels[t] = stitch_gap(
+            np.stack(slices, axis=0),
+            iou_threshold=iou_threshold, max_gap=max_gap,
         )
+
+    return labels
+
+
+# ---------------------------------------------------------------------------
+# Ultrack configuration
+# ---------------------------------------------------------------------------
+def make_ultrack_config(*, working_dir: Path, n_time: int) -> MainConfig:
+    """Build an Ultrack MainConfig from the USER SETTINGS above."""
+    config = MainConfig()
+
+    config.data_config.working_dir = working_dir
+    config.data_config.n_workers = DATA_WORKERS
+
+    seg = config.segmentation_config
+    seg.min_area = MIN_AREA
+    seg.max_area = MAX_AREA
+    seg.min_area_factor = MIN_AREA_FACTOR
+    seg.min_frontier = MIN_FRONTIER
+    seg.threshold = SEG_THRESHOLD
+    seg.max_noise = MAX_NOISE
+    seg.anisotropy_penalization = ANISOTROPY_PENALIZATION
+    seg.random_seed = SEG_RANDOM_SEED
+    seg.n_workers = SEG_WORKERS
+
+    link = config.linking_config
+    link.max_distance = MAX_DISTANCE
+    link.max_neighbors = MAX_NEIGHBORS
+    link.distance_weight = DISTANCE_WEIGHT
+    link.z_score_threshold = LINK_Z_SCORE_THRESHOLD
+    link.n_workers = LINK_WORKERS
+
+    track = config.tracking_config
+    track.solver_name = "" if SOLVER == "auto" else SOLVER
+    track.appear_weight = APPEAR_WEIGHT
+    track.disappear_weight = DISAPPEAR_WEIGHT
+    track.division_weight = DIVISION_WEIGHT
+    track.n_threads = TRACKING_THREADS
+    track.overlap_size = OVERLAP_SIZE
+    track.solution_gap = SOLUTION_GAP
+    track.time_limit = TIME_LIMIT
+    track.method = TRACKING_METHOD
+    track.link_function = LINK_FUNCTION
+    track.power = POWER
+    track.bias = BIAS
+    if WINDOW_SIZE > 0 and n_time > WINDOW_SIZE:
+        track.window_size = WINDOW_SIZE
 
     return config
 
 
-def open_results_in_napari(
+# ---------------------------------------------------------------------------
+# Post-tracking filtering
+# ---------------------------------------------------------------------------
+def _normalize_graph(graph: Any) -> dict[int, list[int]]:
+    """Coerce an Ultrack/napari lineage graph to ``{child: [parent, ...]}``.
+
+    ``Tracker.to_tracks_layer`` returns the lineage as ``{child_id: parent(s)}``,
+    but depending on the installed Ultrack version each value may be a single
+    scalar parent id OR a list of them. napari's Tracks layer accepts either, but
+    the rest of this script iterates the parents, so every value is normalized to
+    a list of Python ints here (called once, right after tracking). A scalar
+    becomes a one-element list; ``None`` / missing becomes an empty list. Without
+    this, a scalar-valued graph raises ``TypeError: 'int' object is not iterable``
+    the first time the parents are iterated.
+    """
+    normalized: dict[int, list[int]] = {}
+    for child, parents in (graph or {}).items():
+        if parents is None:
+            parent_list: list[int] = []
+        else:
+            try:  # already an iterable of parent ids
+                parent_list = [int(p) for p in parents]
+            except TypeError:  # a single scalar parent id (int / np.integer)
+                parent_list = [int(parents)]
+        normalized[int(child)] = parent_list
+    return normalized
+
+
+def _subgraph(graph: dict[int, list[int]] | None, ids: set[int]) -> dict[int, list[int]]:
+    """Restrict a ``{child: [parents]}`` lineage graph to children/parents in ``ids``.
+
+    Children not in ``ids`` are dropped, parents not in ``ids`` are removed from
+    each remaining child, and children left with no parents are dropped too.
+    """
+    restricted = {
+        int(c): [int(p) for p in parents if int(p) in ids]
+        for c, parents in (graph or {}).items()
+        if int(c) in ids
+    }
+    return {child: parents for child, parents in restricted.items() if parents}
+
+
+def _duplicate_segmentation(source: Any, output_path: Path) -> Any:
+    """Copy a (T, Z, Y, X) label Zarr to a new store, one frame at a time.
+
+    ``filter_tracks`` rewrites the tracked segmentation in place, so the unfiltered
+    volume is snapshotted here first (one frame in RAM at a time) to keep both the
+    before- and after-filter versions for the napari view and for export.
+    """
+    duplicate = _new_zarr(source.shape, source.dtype, output_path)
+    for t in tqdm(
+        range(int(source.shape[0])), desc="Snapshotting unfiltered segmentation"
+    ):
+        duplicate[t] = source[t]
+    return duplicate
+
+
+def filter_tracks(
+    tracks_df: pd.DataFrame,
+    graph: dict[int, list[int]],
+    tracked_segments: Any,
+    *,
+    min_frames: int,
+    min_mean_speed: float,
+) -> tuple[pd.DataFrame, dict[int, list[int]]]:
+    """Drop finished tracks that are too short or barely move, and erase the
+    removed cells from ``tracked_segments`` (whose label values equal track ids).
+
+    A track is kept only if it spans at least ``min_frames`` frames AND its mean
+    per-frame centroid step (raw z,y,x voxel distance) is at least
+    ``min_mean_speed`` voxels/frame. The segmentation Zarr is rewritten in place,
+    so the napari view and the exported ``tracked_segments.zarr`` both reflect the
+    filtering.
+    """
+    if tracks_df.empty:
+        return tracks_df, graph
+
+    spatial = [c for c in ("z", "y", "x") if c in tracks_df.columns]
+    keep: set[int] = set()
+    for tid, group in tracks_df.groupby("track_id"):
+        group = group.sort_values("t")
+        steps = np.linalg.norm(np.diff(group[spatial].to_numpy(float), axis=0), axis=1)
+        dt = np.diff(group["t"].to_numpy(float))
+        speed = float(np.mean(steps / np.maximum(dt, 1.0))) if steps.size else 0.0
+        if len(group) >= min_frames and speed >= min_mean_speed:
+            keep.add(int(tid))
+
+    all_ids = {int(i) for i in tracks_df["track_id"].unique()}
+    removed = all_ids - keep
+    print(
+        f"Track filter: kept {len(keep)}/{len(all_ids)} tracks "
+        f"(removed {len(removed)} shorter than {min_frames} frames "
+        f"or slower than {min_mean_speed} voxels/frame)."
+    )
+
+    if removed:
+        # Relabel via a lookup table: kept ids map to themselves, the rest to 0.
+        lut = np.zeros(max(all_ids) + 1, dtype=tracked_segments.dtype)
+        for tid in keep:
+            lut[tid] = tid
+        for t in tqdm(range(int(tracked_segments.shape[0])), desc="Filtering segmentation"):
+            tracked_segments[t] = lut[tracked_segments[t]]
+
+    tracks_df = tracks_df[tracks_df["track_id"].isin(keep)].reset_index(drop=True)
+    graph = _subgraph(graph, keep)
+    return tracks_df, graph
+
+
+# ---------------------------------------------------------------------------
+# napari display
+# ---------------------------------------------------------------------------
+def _add_track_set(
+    viewer: Any,
+    *,
+    segments: Any | None,
+    tracks_df: pd.DataFrame | None,
+    graph: dict[int, list[int]] | None,
+    label: str,
+    scale: tuple[float, ...],
+    axis_labels: tuple[str, ...],
+    tail_length: int,
+    seg_opacity: float,
+    seg_visible: bool,
+    tracks_visible: bool,
+) -> None:
+    """Add one tracked-segmentation labels layer and its trajectories to a viewer.
+
+    ``label`` is appended to the layer names (e.g. "kept (after filter)").
+    """
+    if segments is not None:
+        viewer.add_labels(
+            _label_layer(segments), name=f"segments — {label}",
+            opacity=seg_opacity, visible=seg_visible,
+            scale=scale, axis_labels=axis_labels,
+        )
+    if tracks_df is not None and not tracks_df.empty:
+        cols = [
+            c for c in ("track_id", "t", "z", "y", "x") if c in tracks_df.columns
+        ]
+        viewer.add_tracks(
+            tracks_df[cols].to_numpy(), graph=graph or {},
+            name=f"trajectories — {label}", tail_length=tail_length, tail_width=3,
+            scale=scale, axis_labels=axis_labels, visible=tracks_visible,
+        )
+
+
+def _add_filter_comparison_sets(
+    viewer: Any,
+    *,
+    kept_segments: Any | None,
+    kept_tracks: pd.DataFrame | None,
+    kept_graph: dict[int, list[int]] | None,
+    unfiltered_segments: Any | None,
+    unfiltered_tracks: pd.DataFrame | None,
+    unfiltered_graph: dict[int, list[int]] | None,
+    scale: tuple[float, ...],
+    axis_labels: tuple[str, ...],
+    tail_length: int,
+) -> None:
+    """Add kept / removed / all-(unfiltered) segmentation+track layers to a viewer.
+
+    The kept (post-filter) set is always shown. When an unfiltered snapshot is
+    supplied, two more layer pairs are added so you can see what ``filter_tracks``
+    discarded:
+
+      * "REMOVED by filter" — exactly the cells and trajectories the filter
+        dropped (unfiltered minus kept), drawn on top at higher opacity;
+      * "all (before filter)" — the full pre-filter set, hidden by default and
+        available with a single visibility toggle.
+
+    With no unfiltered snapshot this reduces to the original single (kept) set.
+    """
+    # Post-filter result: always visible, normal opacity.
+    _add_track_set(
+        viewer, segments=kept_segments, tracks_df=kept_tracks, graph=kept_graph,
+        label="kept (after filter)", scale=scale, axis_labels=axis_labels,
+        tail_length=tail_length, seg_opacity=0.28, seg_visible=True,
+        tracks_visible=True,
+    )
+
+    has_snapshot = unfiltered_segments is not None or (
+        unfiltered_tracks is not None and not unfiltered_tracks.empty
+    )
+    if not has_snapshot:
+        return
+
+    # Track ids the filter dropped (kept ids come straight from the filtered df).
+    removed_ids: set[int] = set()
+    if unfiltered_tracks is not None and not unfiltered_tracks.empty:
+        all_ids = {int(i) for i in unfiltered_tracks["track_id"].unique()}
+        kept_ids = (
+            {int(i) for i in kept_tracks["track_id"].unique()}
+            if kept_tracks is not None and not kept_tracks.empty else set()
+        )
+        removed_ids = all_ids - kept_ids
+
+    if removed_ids:
+        # Removed segmentation = unfiltered voxels that are background in the kept
+        # (filtered) volume. The two share every kept-cell voxel exactly, so this
+        # isolates only the dropped cells. Stays lazy: napari computes one frame at
+        # a time, never the whole 4D difference at once.
+        removed_segments = None
+        if unfiltered_segments is not None:
+            removed_segments = (
+                da.where(
+                    _as_dask(kept_segments) == 0, _as_dask(unfiltered_segments), 0
+                )
+                if kept_segments is not None else unfiltered_segments
+            )
+        removed_tracks = unfiltered_tracks[
+            unfiltered_tracks["track_id"].isin(removed_ids)
+        ].reset_index(drop=True)
+        removed_graph = _subgraph(unfiltered_graph, removed_ids)
+        _add_track_set(
+            viewer, segments=removed_segments, tracks_df=removed_tracks,
+            graph=removed_graph, label="REMOVED by filter", scale=scale,
+            axis_labels=axis_labels, tail_length=tail_length, seg_opacity=0.5,
+            seg_visible=True, tracks_visible=True,
+        )
+
+    # Full pre-filter set, hidden by default (toggle on to see the before-state).
+    _add_track_set(
+        viewer, segments=unfiltered_segments, tracks_df=unfiltered_tracks,
+        graph=unfiltered_graph, label="all (before filter)", scale=scale,
+        axis_labels=axis_labels, tail_length=tail_length, seg_opacity=0.28,
+        seg_visible=False, tracks_visible=False,
+    )
+
+
+def open_in_napari(
     *,
     stabilized: Any,
     stabilized_context: Any | None,
-    foreground: Any,
-    contours: Any,
-    tracked_segments: Any,
-    tracks_df: pd.DataFrame,
-    graph: dict[int, list[int]],
+    labels_3d: Any | None,
+    foreground: Any | None,
+    contours: Any | None,
+    tracked_segments: Any | None,
+    tracks_df: pd.DataFrame | None,
+    graph: dict[int, list[int]] | None,
     napari_scale: tuple[float, ...],
-    is_3d: bool,
+    axis_labels: tuple[str, ...],
     tail_length: int,
     title: str,
+    tracked_segments_unfiltered: Any | None = None,
+    tracks_df_unfiltered: pd.DataFrame | None = None,
+    graph_unfiltered: dict[int, list[int]] | None = None,
 ) -> None:
+    """Display the stabilized volume, segmentation, and (optionally) tracks.
+
+    When an unfiltered tracks/segmentation snapshot is supplied (taken before
+    ``filter_tracks`` ran), the viewer shows the kept result, the cells/tracks
+    the filter removed, and the full pre-filter set as separate toggleable layers.
+    """
     viewer = napari.Viewer(title=title)
-    axis_labels = ("t", "z", "y", "x") if is_3d else ("t", "y", "x")
+
+    def image(array: Any, **kw: Any) -> None:
+        viewer.add_image(
+            _as_dask(array), scale=napari_scale, axis_labels=axis_labels, **kw
+        )
+
+    def labels(array: Any, **kw: Any) -> None:
+        viewer.add_labels(
+            _label_layer(array), scale=napari_scale, axis_labels=axis_labels, **kw
+        )
 
     if stabilized_context is not None:
-        viewer.add_image(
-            stabilized_context,
-            name="stabilized fish context",
-            colormap="gray",
-            scale=napari_scale,
-            axis_labels=axis_labels,
-        )
-        viewer.add_image(
-            stabilized,
-            name="stabilized neutrophil channel",
-            colormap="magenta",
-            blending="additive",
-            scale=napari_scale,
-            axis_labels=axis_labels,
+        image(stabilized_context, name="stabilized context", colormap="gray")
+        image(
+            stabilized, name="stabilized track channel",
+            colormap="magenta", blending="additive",
         )
     else:
-        viewer.add_image(
-            stabilized,
-            name="stabilized fish / neutrophils",
-            colormap="gray",
-            scale=napari_scale,
-            axis_labels=axis_labels,
-        )
-    viewer.add_labels(
-        tracked_segments,
-        name="Ultrack tracked segments",
-        opacity=0.28,
-        scale=napari_scale,
-        axis_labels=axis_labels,
-    )
-    viewer.add_labels(
-        foreground,
-        name="foreground used by Ultrack",
-        opacity=0.25,
-        visible=False,
-        scale=napari_scale,
-        axis_labels=axis_labels,
-    )
-    viewer.add_image(
-        contours,
-        name="contours used by Ultrack",
-        opacity=0.55,
-        visible=False,
-        blending="additive",
-        scale=napari_scale,
-        axis_labels=axis_labels,
-    )
+        image(stabilized, name="stabilized track channel", colormap="gray")
 
-    if not tracks_df.empty:
-        spatial_columns = ["z", "y", "x"] if is_3d else ["y", "x"]
-        tracks_data = tracks_df[["track_id", "t", *spatial_columns]].to_numpy()
-        viewer.add_tracks(
-            tracks_data,
-            graph=graph,
-            name="Ultrack trajectories",
-            tail_length=tail_length,
-            tail_width=3,
-            scale=napari_scale,
-            axis_labels=axis_labels,
+    if labels_3d is not None:
+        labels(
+            labels_3d, name="3D labels (Cellpose stitched)",
+            opacity=0.4, visible=tracked_segments is None,
         )
-    else:
+    if foreground is not None:
+        labels(
+            foreground, name="foreground used by Ultrack",
+            opacity=0.25, visible=False,
+        )
+    if contours is not None:
+        image(
+            contours, name="contours used by Ultrack",
+            opacity=0.55, visible=False, blending="additive",
+        )
+    # Tracked segmentation + trajectories, split into kept / removed / all so the
+    # cells and tracks dropped by filter_tracks stay visible (and toggleable)
+    # alongside the kept result. See _add_filter_comparison_sets.
+    _add_filter_comparison_sets(
+        viewer,
+        kept_segments=tracked_segments, kept_tracks=tracks_df, kept_graph=graph,
+        unfiltered_segments=tracked_segments_unfiltered,
+        unfiltered_tracks=tracks_df_unfiltered, unfiltered_graph=graph_unfiltered,
+        scale=napari_scale, axis_labels=axis_labels, tail_length=tail_length,
+    )
+    if tracked_segments is not None and (tracks_df is None or tracks_df.empty):
         warnings.warn("Ultrack returned no tracks; inspect the foreground layer.")
 
-    if is_3d:
-        viewer.dims.ndisplay = 3
     napari.run()
 
 
-def main() -> None:
-    validate_settings()
+# ---------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------
+def _resolve_time_subset(
+    subset: int | tuple[int, int] | None, n_total: int
+) -> tuple[int, int]:
+    """Resolve TIME_SUBSET into a half-open ``[start, stop)`` frame range.
 
+    ``None``           -> the whole movie, ``[0, n_total)``.
+    an ``int`` N       -> the single frame N, i.e. ``[N, N + 1)``.
+    a ``(lo, hi)`` pair-> the INCLUSIVE range lo..hi, i.e. ``[lo, hi + 1)``.
+
+    Raises ``IndexError`` if the request falls outside ``0..n_total - 1`` or is
+    reversed (``stop < start``).
+    """
+    if subset is None:
+        return 0, n_total
+    lo, hi = (subset, subset) if isinstance(subset, int) else subset
+    lo, hi = int(lo), int(hi)
+    if not 0 <= lo <= hi < n_total:
+        raise IndexError(
+            f"TIME_SUBSET {subset!r} is outside 0..{n_total - 1} "
+            f"(need 0 <= start <= stop)."
+        )
+    return lo, hi + 1
+
+
+def main() -> None:
     czi_path = Path(CZI_PATH).expanduser().resolve()
     if not czi_path.is_file():
         raise FileNotFoundError(czi_path)
@@ -456,46 +1168,52 @@ def main() -> None:
     print(f"Channels: {image.channel_names}")
 
     n_channels = int(image.dims.C)
-    for name, channel in (
-        ("track", TRACK_CHANNEL),
-        ("registration", registration_channel),
-    ):
+    for name, channel in (("track", TRACK_CHANNEL), ("registration", registration_channel)):
         if not 0 <= channel < n_channels:
-            raise IndexError(
-                f"{name} channel {channel} is outside 0..{n_channels - 1}"
-            )
+            raise IndexError(f"{name} channel {channel} is outside 0..{n_channels - 1}")
 
     track_tzyx = image.get_image_dask_data("TZYX", C=TRACK_CHANNEL)
-    registration_tzyx = image.get_image_dask_data(
-        "TZYX", C=registration_channel
-    )
-    if int(track_tzyx.shape[0]) < 2:
-        raise ValueError("Tracking requires at least two time points.")
+    registration_tzyx = image.get_image_dask_data("TZYX", C=registration_channel)
 
-    z_count = int(track_tzyx.shape[1])
-    is_3d = (not PROJECT_2D) and z_count > 1
-    if is_3d:
-        movie = track_tzyx
-    elif z_count == 1:
-        movie = track_tzyx[:, 0]
-    else:
-        movie = track_tzyx.max(axis=1)
+    # Select the requested slice of time points (TIME_SUBSET). The single-frame
+    # quick test is just the length-1 case: any slice shorter than two frames
+    # cannot be linked, so we segment it and show the result without tracking.
+    n_total = int(track_tzyx.shape[0])
+    start, stop = _resolve_time_subset(TIME_SUBSET, n_total)
+    track_tzyx = track_tzyx[start:stop]
+    registration_tzyx = registration_tzyx[start:stop]
+    n_frames = stop - start
+    scope = f"frame {start}" if n_frames == 1 else f"frames {start}-{stop - 1}"
+    subset_label = "" if TIME_SUBSET is None else f" — {scope}"
 
-    # Always estimate the simple XY camera shift from a Z maximum projection.
-    if int(registration_tzyx.shape[1]) == 1:
-        registration_projection = registration_tzyx[:, 0]
-    else:
-        registration_projection = registration_tzyx.max(axis=1)
+    segmentation_only = n_frames < 2
+    if TIME_SUBSET is not None:
+        skip = "; tracking will be skipped" if segmentation_only else ""
+        print(f"TIME SUBSET: processing {n_frames} frame(s) ({scope}){skip}.")
+    elif segmentation_only:
+        raise ValueError(
+            "Tracking requires at least two time points (set TIME_SUBSET to a "
+            "single frame or a (start, stop) range to test on a subset)."
+        )
 
+    # Fail fast before the multi-hour segmentation: a tracking run ends in
+    # labels_to_contours, which Ultrack executes on the GPU when CuPy is present
+    # and which then requires cuCIM. Segmentation-only runs skip tracking (and
+    # thus labels_to_contours), so they are exempt. See _check_gpu_imgproc_stack.
+    if not segmentation_only:
+        _check_gpu_imgproc_stack()
+
+    if int(track_tzyx.shape[1]) < 2:
+        warnings.warn("The selected scene has a single Z plane; stitching is a no-op.")
+
+    # Estimate the global XY shift from the registration channel's 2D projection.
     if NO_STABILIZATION:
-        shifts_yx = np.zeros((int(movie.shape[0]), 2), dtype=float)
+        shifts_yx = np.zeros((int(track_tzyx.shape[0]), 2), dtype=float)
     else:
         shifts_yx = estimate_xy_shifts(
-            registration_projection,
-            downsample=REGISTRATION_DOWNSAMPLE,
-            sigma=REGISTRATION_SIGMA,
-            upsample_factor=REGISTRATION_UPSAMPLE,
-            max_shift_px=MAX_REGISTRATION_SHIFT,
+            _project_to_2d(registration_tzyx),
+            downsample=REGISTRATION_DOWNSAMPLE, sigma=REGISTRATION_SIGMA,
+            upsample_factor=REGISTRATION_UPSAMPLE, max_shift_px=MAX_REGISTRATION_SHIFT,
         )
 
     pd.DataFrame(
@@ -506,28 +1224,18 @@ def main() -> None:
         }
     ).to_csv(output_dir / "stabilization_shifts.csv", index=False)
 
-    stabilized = write_stabilized_movie(
-        movie,
-        shifts_yx,
-        output_dir / "stabilized.zarr",
-        description="Writing stabilized neutrophil channel",
+    # Apply the same XY shift to every Z slice of the 3D volume.
+    stabilized_path = output_dir / "stabilized.zarr"
+    stabilized = write_stabilized_volume(
+        track_tzyx, shifts_yx, stabilized_path,
+        description="Writing stabilized track volume",
     )
 
-    # When a separate structural/brightfield channel was used for registration,
-    # stabilize it with the identical shifts so the fish is visible under the tracks.
     stabilized_context = None
     if registration_channel != TRACK_CHANNEL:
-        if is_3d:
-            context_movie = registration_tzyx
-        elif int(registration_tzyx.shape[1]) == 1:
-            context_movie = registration_tzyx[:, 0]
-        else:
-            context_movie = registration_tzyx.max(axis=1)
-        stabilized_context = write_stabilized_movie(
-            context_movie,
-            shifts_yx,
-            output_dir / "stabilized_context.zarr",
-            description="Writing stabilized fish context",
+        stabilized_context = write_stabilized_volume(
+            registration_tzyx, shifts_yx, output_dir / "stabilized_context.zarr",
+            description="Writing stabilized context volume",
         )
 
     pixel_sizes = image.physical_pixel_sizes
@@ -535,105 +1243,227 @@ def main() -> None:
     pixel_y = _positive_float(pixel_sizes.Y, pixel_x)
     pixel_z = _positive_float(pixel_sizes.Z, pixel_x)
 
-    # Ultrack's link distance is measured after this scaling. Normalizing by X
-    # keeps MAX_DISTANCE interpretable as approximately X pixels while still
-    # accounting for anisotropic Z/Y sampling.
-    if is_3d:
-        spatial_scale = (pixel_z / pixel_x, pixel_y / pixel_x, 1.0)
-        napari_scale = (1.0, pixel_z, pixel_y, pixel_x)
-    else:
-        spatial_scale = (pixel_y / pixel_x, 1.0)
-        napari_scale = (1.0, pixel_y, pixel_x)
+    # Scales normalized by X so MAX_DISTANCE stays in ~X-pixel units (order z, y, x).
+    spatial_scale = (pixel_z / pixel_x, pixel_y / pixel_x, 1.0)
+    napari_scale = (1.0, pixel_z, pixel_y, pixel_x)
+    axis_labels = ("t", "z", "y", "x")
 
-    foreground, contours = generate_ultrack_inputs(
-        stabilized,
-        output_dir=output_dir,
-        spatial_scale=spatial_scale,
-        foreground_sigma=FOREGROUND_SIGMA,
-        boundary_sigma=BOUNDARY_SIGMA,
-        min_foreground=MIN_FOREGROUND,
-        remove_hist_mode=not KEEP_HISTOGRAM_MODE,
-    )
+    # Everything downstream of stabilization operates on sqrt(intensity). The
+    # compression is applied here, once, and every intensity consumer below (the
+    # global window and the per-slice Cellpose normalization inside
+    # segment_and_stitch) reads from this transformed volume. The REAL
+    # `stabilized` volume is left untouched and is what gets handed to napari
+    # further down, so on-screen you still inspect the raw image. This stays lazy
+    # -- a dask view over the stabilized Zarr -- because sqrt is a cheap
+    # elementwise op, so no second 4D volume is written to disk.
+    stabilized_sqrt = da.sqrt(_as_dask(stabilized))
 
-    config = make_ultrack_config(
-        working_dir=work_dir,
-        n_time=int(stabilized.shape[0]),
-        workers=WORKERS,
-        min_area=MIN_AREA,
-        max_area=MAX_AREA,
-        max_distance=MAX_DISTANCE,
-        max_neighbors=MAX_NEIGHBORS,
-        solver=SOLVER,
-        window_size=WINDOW_SIZE,
-        overlap_size=OVERLAP_SIZE,
+    # One global intensity window keeps dim fish dark for every slice. It is
+    # estimated on the sqrt volume so the window matches the data Cellpose
+    # actually sees; the bounds below are therefore in sqrt-intensity units, not
+    # raw counts.
+    norm_low, norm_high = estimate_intensity_bounds(
+        stabilized_sqrt, low_percentile=NORM_LOW_PERCENTILE,
+        high_percentile=NORM_HIGH_PERCENTILE, sample_frames=NORM_SAMPLE_FRAMES,
     )
-    tracker = Tracker(config)
-    tracker.track(
-        foreground=foreground,
-        contours=contours,
-        scale=spatial_scale,
-        overwrite="all",
+    print(
+        f"Global intensity window (sqrt-intensity units): "
+        f"[{norm_low:.3f}, {norm_high:.3f}] "
+        f"(p{NORM_LOW_PERCENTILE:g}-p{NORM_HIGH_PERCENTILE:g})"
     )
 
-    tracks_df, graph = tracker.to_tracks_layer()
-    tracker.export_by_extension(str(output_dir / "tracks.csv"), overwrite=True)
-    tracker.export_by_extension(str(output_dir / "tracks.xml"), overwrite=True)
-    tracker.export_by_extension(
-        str(output_dir / "tracks_graph.json"), overwrite=True
-    )
-    tracked_segments = tracker.to_zarr(
-        store_or_path=str(output_dir / "tracked_segments.zarr"),
-        overwrite=True,
+    # Segment each Z slice in 2D and stitch into 3D labels. This runs on the
+    # sqrt volume (normalized with the sqrt-domain window above); napari is
+    # still shown the raw `stabilized` volume.
+    labels_3d_path = output_dir / "labels_3d.zarr"
+    labels_3d = segment_and_stitch(
+        stabilized_sqrt, output_path=labels_3d_path,
+        pretrained_model=CELLPOSE_MODEL, diameter=CELLPOSE_DIAMETER, gpu=CELLPOSE_GPU,
+        batch_size=CELLPOSE_BATCH_SIZE,
+        flow_threshold=CELLPOSE_FLOW_THRESHOLD,
+        cellprob_threshold=CELLPOSE_CELLPROB_THRESHOLD,
+        norm_low=norm_low, norm_high=norm_high,
+        min_cell_norm_intensity=MIN_CELL_NORM_INTENSITY,
+        slice_filter=SLICE_FILTER_ENABLED,
+        slice_min_area=MIN_AREA, slice_max_area=MAX_AREA,
+        slice_max_eccentricity=SLICE_MAX_ECCENTRICITY,
+        slice_min_solidity=SLICE_MIN_SOLIDITY,
+        iou_threshold=STITCH_IOU_THRESHOLD, max_gap=STITCH_MAX_Z_GAP,
     )
 
-    parameters = {
+    base_parameters = {
         "czi": str(czi_path),
         "output": str(output_dir),
         "scene": SCENE,
         "track_channel": TRACK_CHANNEL,
         "registration_channel": registration_channel,
-        "project_2d": PROJECT_2D,
         "no_stabilization": NO_STABILIZATION,
+        "downstream_intensity_transform": "sqrt",  # window + segmentation run on sqrt(intensity)
+        "time_subset": list(TIME_SUBSET) if isinstance(TIME_SUBSET, tuple) else TIME_SUBSET,
+        "time_range_inclusive": [start, stop - 1],
+        "n_frames": n_frames,
         "registration_downsample": REGISTRATION_DOWNSAMPLE,
         "registration_sigma": REGISTRATION_SIGMA,
         "registration_upsample": REGISTRATION_UPSAMPLE,
         "max_registration_shift": MAX_REGISTRATION_SHIFT,
-        "foreground_sigma": FOREGROUND_SIGMA,
-        "boundary_sigma": BOUNDARY_SIGMA,
-        "min_foreground": MIN_FOREGROUND,
-        "keep_histogram_mode": KEEP_HISTOGRAM_MODE,
+        "cellpose_model": CELLPOSE_MODEL,
+        "cellpose_diameter": CELLPOSE_DIAMETER,
+        "cellpose_batch_size": CELLPOSE_BATCH_SIZE,
+        "cellpose_gpu": CELLPOSE_GPU,
+        "cellpose_flow_threshold": CELLPOSE_FLOW_THRESHOLD,
+        "cellpose_cellprob_threshold": CELLPOSE_CELLPROB_THRESHOLD,
+        "stitch_iou_threshold": STITCH_IOU_THRESHOLD,
+        "stitch_max_z_gap": STITCH_MAX_Z_GAP,
+        "norm_low_percentile": NORM_LOW_PERCENTILE,
+        "norm_high_percentile": NORM_HIGH_PERCENTILE,
+        "norm_window": (norm_low, norm_high),
+        "min_cell_norm_intensity": MIN_CELL_NORM_INTENSITY,
+        "slice_filter_enabled": SLICE_FILTER_ENABLED,
+        "slice_filter_min_area": MIN_AREA,
+        "slice_filter_max_area": MAX_AREA,
+        "slice_max_eccentricity": SLICE_MAX_ECCENTRICITY,
+        "slice_min_solidity": SLICE_MIN_SOLIDITY,
+        "contour_sigma": CONTOUR_SIGMA,
+        "physical_pixel_sizes_zyx": (pixel_z, pixel_y, pixel_x),
+        "spatial_scale_zyx": spatial_scale,
+    }
+
+    # Too few frames to link: stop after segmentation and show the result.
+    if segmentation_only:
+        with open(output_dir / "run_parameters.json", "w", encoding="utf-8") as stream:
+            json.dump({**base_parameters, "mode": "segmentation_test"}, stream, indent=2)
+        print("Segmentation test complete. Wrote:")
+        print(f"  {stabilized_path}")
+        print(f"  {labels_3d_path}")
+        open_in_napari(
+            stabilized=stabilized, stabilized_context=stabilized_context,
+            labels_3d=labels_3d, foreground=None, contours=None,
+            tracked_segments=None, tracks_df=None, graph=None,
+            napari_scale=napari_scale, axis_labels=axis_labels,
+            tail_length=TAIL_LENGTH,
+            title=f"{czi_path.name} — segmentation test (frame {start})",
+        )
+        return
+
+    # Convert the 3D labels to Ultrack foreground/contours. Pass disk-backed store
+    # paths when the installed Ultrack accepts them (keeps large volumes off-RAM).
+    l2c_kwargs: dict[str, Any] = {"sigma": CONTOUR_SIGMA}
+    l2c_params = inspect.signature(labels_to_contours).parameters
+    if "foreground_store_or_path" in l2c_params:
+        l2c_kwargs["foreground_store_or_path"] = str(output_dir / "foreground.zarr")
+    if "contours_store_or_path" in l2c_params:
+        l2c_kwargs["contours_store_or_path"] = str(output_dir / "contours.zarr")
+    if "overwrite" in l2c_params:
+        l2c_kwargs["overwrite"] = True
+    foreground, contours = labels_to_contours(_as_dask(labels_3d), **l2c_kwargs)
+
+    # Track in 3D.
+    config = make_ultrack_config(working_dir=work_dir, n_time=int(stabilized.shape[0]))
+    tracker = Tracker(config)
+    tracker.track(
+        foreground=foreground, contours=contours, scale=spatial_scale, overwrite="all",
+    )
+
+    tracks_df, graph = tracker.to_tracks_layer()
+    # Ultrack returns the lineage graph as {child: parent(s)}, where each value
+    # may be a single scalar parent id or a list depending on the installed
+    # version. Everything below (the unfiltered snapshot, filter_tracks, the JSON
+    # exports, and the napari overlays) iterates the parents, so normalize the
+    # values to lists of ints once, here.
+    graph = _normalize_graph(graph)
+    tracked_segments = tracker.to_zarr(
+        store_or_path=str(output_dir / "tracked_segments.zarr"), overwrite=True,
+    )
+
+    # Snapshot the UNFILTERED tracks and segmentation before filtering, so the
+    # napari view (and these exports) can show what the filter removes.
+    # filter_tracks rewrites tracked_segments in place, so the segmentation has to
+    # be copied to a separate store first.
+    tracks_df_unfiltered = tracks_df.copy()
+    graph_unfiltered = {c: list(p) for c, p in graph.items()}
+    tracked_segments_unfiltered = _duplicate_segmentation(
+        tracked_segments, output_dir / "tracked_segments_unfiltered.zarr",
+    )
+    tracks_df_unfiltered.to_csv(output_dir / "tracks_unfiltered.csv", index=False)
+    with open(
+        output_dir / "tracks_graph_unfiltered.json", "w", encoding="utf-8"
+    ) as stream:
+        json.dump(graph_unfiltered, stream, indent=2)
+
+    # Drop short / near-stationary tracks and erase those cells from the
+    # segmentation, then export the FILTERED tracks and lineage graph.
+    tracks_df, graph = filter_tracks(
+        tracks_df, graph, tracked_segments,
+        min_frames=MIN_TRACK_LENGTH, min_mean_speed=MIN_MEAN_SPEED,
+    )
+    tracks_df.to_csv(output_dir / "tracks.csv", index=False)
+    with open(output_dir / "tracks_graph.json", "w", encoding="utf-8") as stream:
+        json.dump(graph, stream, indent=2)
+
+    parameters = {
+        **base_parameters,
+        "mode": "track",
+        "data_workers": DATA_WORKERS,
         "min_area": MIN_AREA,
         "max_area": MAX_AREA,
+        "min_area_factor": MIN_AREA_FACTOR,
+        "min_frontier": MIN_FRONTIER,
+        "seg_threshold": SEG_THRESHOLD,
+        "max_noise": MAX_NOISE,
+        "anisotropy_penalization": ANISOTROPY_PENALIZATION,
+        "seg_random_seed": SEG_RANDOM_SEED,
+        "seg_workers": SEG_WORKERS,
         "max_distance": MAX_DISTANCE,
         "max_neighbors": MAX_NEIGHBORS,
+        "distance_weight": DISTANCE_WEIGHT,
+        "link_z_score_threshold": LINK_Z_SCORE_THRESHOLD,
+        "link_workers": LINK_WORKERS,
+        "solver": SOLVER,
+        "appear_weight": APPEAR_WEIGHT,
+        "disappear_weight": DISAPPEAR_WEIGHT,
+        "division_weight": DIVISION_WEIGHT,
+        "tracking_threads": TRACKING_THREADS,
+        "solution_gap": SOLUTION_GAP,
+        "time_limit": TIME_LIMIT,
+        "tracking_method": TRACKING_METHOD,
+        "link_function": LINK_FUNCTION,
+        "power": POWER,
+        "bias": BIAS,
         "window_size": WINDOW_SIZE,
         "overlap_size": OVERLAP_SIZE,
-        "solver": SOLVER,
-        "workers": WORKERS,
+        "min_track_length": MIN_TRACK_LENGTH,
+        "min_mean_speed": MIN_MEAN_SPEED,
         "tail_length": TAIL_LENGTH,
-        "is_3d": is_3d,
-        "spatial_scale": spatial_scale,
-        "physical_pixel_sizes_zyx": (pixel_z, pixel_y, pixel_x),
+        "tracks_unfiltered_csv": "tracks_unfiltered.csv",
+        "tracks_graph_unfiltered_json": "tracks_graph_unfiltered.json",
+        "tracked_segments_unfiltered_zarr": "tracked_segments_unfiltered.zarr",
     }
     with open(output_dir / "run_parameters.json", "w", encoding="utf-8") as stream:
         json.dump(parameters, stream, indent=2)
 
     n_tracks = int(tracks_df["track_id"].nunique()) if not tracks_df.empty else 0
-    print(f"Exported {n_tracks} tracks and {len(tracks_df)} detections to:")
-    print(output_dir)
+    n_tracks_unfiltered = (
+        int(tracks_df_unfiltered["track_id"].nunique())
+        if not tracks_df_unfiltered.empty else 0
+    )
+    print(
+        f"Exported {n_tracks} kept tracks ({len(tracks_df)} detections); "
+        f"{n_tracks_unfiltered} tracks before filtering. Outputs in {output_dir}:"
+    )
+    print("  filtered:    tracks.csv, tracks_graph.json, tracked_segments.zarr")
+    print(
+        "  unfiltered:  tracks_unfiltered.csv, tracks_graph_unfiltered.json, "
+        "tracked_segments_unfiltered.zarr"
+    )
 
-    open_results_in_napari(
-        stabilized=stabilized,
-        stabilized_context=stabilized_context,
-        foreground=foreground,
-        contours=contours,
-        tracked_segments=tracked_segments,
-        tracks_df=tracks_df,
-        graph=graph,
-        napari_scale=napari_scale,
-        is_3d=is_3d,
-        tail_length=TAIL_LENGTH,
-        title=f"{czi_path.name} — Ultrack neutrophils",
+    open_in_napari(
+        stabilized=stabilized, stabilized_context=stabilized_context,
+        labels_3d=labels_3d, foreground=foreground, contours=contours,
+        tracked_segments=tracked_segments, tracks_df=tracks_df, graph=graph,
+        tracked_segments_unfiltered=tracked_segments_unfiltered,
+        tracks_df_unfiltered=tracks_df_unfiltered, graph_unfiltered=graph_unfiltered,
+        napari_scale=napari_scale, axis_labels=axis_labels, tail_length=TAIL_LENGTH,
+        title=f"{czi_path.name} — Ultrack neutrophils (3D){subset_label}",
     )
 
 

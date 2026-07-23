@@ -31,9 +31,14 @@ Edit the USER SETTINGS block, then run:
 
     python tracker.py
 
+List one or more movies in CZI_PATHS: each is processed in turn (its outputs
+written to its own folder), then all are opened together in a SINGLE napari
+window with a "Movie" dropdown to switch between them -- no extra windows.
+Command-line parameters are not accepted.
+
 Set TIME_SUBSET to a single frame index to segment just one frame (fast) and skip
 tracking, or to a (start, stop) pair to run the full pipeline on only that
-inclusive range of frames. Command-line parameters are not accepted.
+inclusive range of frames.
 """
 
 from __future__ import annotations
@@ -42,6 +47,7 @@ import inspect
 import json
 import logging
 import sys
+import traceback
 import warnings
 from pathlib import Path
 from typing import Any
@@ -76,9 +82,23 @@ warnings.filterwarnings(
 # USER SETTINGS — edit these values before running the script
 # =============================================================================
 
-# Input and output
-CZI_PATH = Path("/mnt/d/JerisonServer/Eric/Lightfield demo/2026-03-27-mpx-r848-dss-7dpf/processed/Z-subsets/Bath-5.czi")
-OUTPUT_DIR: Path | None = Path("data")  # None -> <CZI filename>_ultrack beside the CZI
+# Input and output.
+# List one or more movies here. Each is processed independently and then all are
+# shown together in one napari window (a "Movie" dropdown switches between them).
+CZI_PATHS: list[Path] = [
+    Path("/mnt/d/JerisonServer/Eric/Lightfield demo/2026-03-27-mpx-r848-dss-7dpf/processed/Z-subsets/Bath-5.czi"),
+    Path("/mnt/d/JerisonServer/Eric/Lightfield demo/2026-03-27-mpx-r848-dss-7dpf/processed/Z-subsets/Bath-2.czi"),
+    Path("/mnt/d/JerisonServer/Eric/Lightfield demo/2026-03-27-mpx-r848-dss-7dpf/processed/Z-subsets/Bath-8.czi"),
+    Path("/mnt/d/JerisonServer/Eric/Lightfield demo/2026-03-27-mpx-r848-dss-7dpf/processed/Z-subsets/11.czi"),
+    Path("/mnt/d/JerisonServer/Eric/Lightfield demo/2026-03-27-mpx-r848-dss-7dpf/processed/Z-subsets/20.czi"),
+    Path("/mnt/d/JerisonServer/Eric/Lightfield demo/2026-03-27-mpx-r848-dss-7dpf/processed/Z-subsets/22.czi"),
+    # add more movies here, e.g.:
+    # Path("/mnt/d/JerisonServer/Eric/Lightfield demo/2026-03-27-mpx-r848-dss-7dpf/processed/Z-subsets/Bath-6.czi"),
+]
+# Each movie writes to its OWN folder so several movies never clobber each other:
+#   OUTPUT_DIR set   -> <OUTPUT_DIR>/<CZI filename>/
+#   OUTPUT_DIR None  -> <CZI filename>_ultrack beside each CZI
+OUTPUT_DIR: Path | None = Path("data")
 
 # CZI selection and processing mode
 SCENE = 0
@@ -97,7 +117,7 @@ NO_STABILIZATION = False
 #                       slice behaves exactly like the single-frame case above.
 # Reported frame numbers (napari titles, run_parameters.json) use the original
 # absolute indices; the arrays are re-indexed from 0 within the slice.
-TIME_SUBSET: int | tuple[int, int] | None = None
+TIME_SUBSET: int | tuple[int, int] | None = [10,50]
 
 # Registration settings (simple global XY translation).
 REGISTRATION_DOWNSAMPLE = 2
@@ -919,196 +939,151 @@ def filter_tracks(
 # ---------------------------------------------------------------------------
 # napari display
 # ---------------------------------------------------------------------------
-def _add_track_set(
-    viewer: Any,
-    *,
-    segments: Any | None,
-    tracks_df: pd.DataFrame | None,
-    graph: dict[int, list[int]] | None,
-    label: str,
-    scale: tuple[float, ...],
-    axis_labels: tuple[str, ...],
-    tail_length: int,
-    seg_opacity: float,
-    seg_visible: bool,
-    tracks_visible: bool,
+def _add_movie_layers(
+    viewer: Any, *, name: str, prefix: str, bundle: dict[str, Any]
 ) -> None:
-    """Add one tracked-segmentation labels layer and its trajectories to a viewer.
+    """Add every layer for one movie to a shared viewer.
 
-    ``label`` is appended to the layer names (e.g. "kept (after filter)").
+    Each layer is tagged with ``metadata["movie"] = name`` plus its intended
+    ("base") visibility and is added hidden; ``_show_movie`` later reveals the
+    active movie's layers (honouring each layer's base visibility). Layer names
+    are ``prefix``-ed so a multi-movie layer list stays readable.
+
+    The tracked segmentation and trajectories are shown as just two toggleable
+    sets -- the cells/tracks ``filter_tracks`` KEPT and the ones it REMOVED. There
+    is no separate "all" set: turn both on together to see the pre-filter picture.
     """
-    if segments is not None:
-        viewer.add_labels(
-            _label_layer(segments), name=f"segments — {label}",
-            opacity=seg_opacity, visible=seg_visible,
-            scale=scale, axis_labels=axis_labels,
-        )
-    if tracks_df is not None and not tracks_df.empty:
-        cols = [
-            c for c in ("track_id", "t", "z", "y", "x") if c in tracks_df.columns
-        ]
-        viewer.add_tracks(
-            tracks_df[cols].to_numpy(), graph=graph or {},
-            name=f"trajectories — {label}", tail_length=tail_length, tail_width=3,
-            scale=scale, axis_labels=axis_labels, visible=tracks_visible,
-        )
+    scale = bundle["napari_scale"]
+    axes = bundle["axis_labels"]
+    tail = bundle["tail_length"]
 
+    def meta(base_visible: bool) -> dict[str, Any]:
+        return {"movie": name, "base_visible": base_visible}
 
-def _add_filter_comparison_sets(
-    viewer: Any,
-    *,
-    kept_segments: Any | None,
-    kept_tracks: pd.DataFrame | None,
-    kept_graph: dict[int, list[int]] | None,
-    unfiltered_segments: Any | None,
-    unfiltered_tracks: pd.DataFrame | None,
-    unfiltered_graph: dict[int, list[int]] | None,
-    scale: tuple[float, ...],
-    axis_labels: tuple[str, ...],
-    tail_length: int,
-) -> None:
-    """Add kept / removed / all-(unfiltered) segmentation+track layers to a viewer.
-
-    The kept (post-filter) set is always shown. When an unfiltered snapshot is
-    supplied, two more layer pairs are added so you can see what ``filter_tracks``
-    discarded:
-
-      * "REMOVED by filter" — exactly the cells and trajectories the filter
-        dropped (unfiltered minus kept), drawn on top at higher opacity;
-      * "all (before filter)" — the full pre-filter set, hidden by default and
-        available with a single visibility toggle.
-
-    With no unfiltered snapshot this reduces to the original single (kept) set.
-    """
-    # Post-filter result: always visible, normal opacity.
-    _add_track_set(
-        viewer, segments=kept_segments, tracks_df=kept_tracks, graph=kept_graph,
-        label="kept (after filter)", scale=scale, axis_labels=axis_labels,
-        tail_length=tail_length, seg_opacity=0.28, seg_visible=True,
-        tracks_visible=True,
-    )
-
-    has_snapshot = unfiltered_segments is not None or (
-        unfiltered_tracks is not None and not unfiltered_tracks.empty
-    )
-    if not has_snapshot:
-        return
-
-    # Track ids the filter dropped (kept ids come straight from the filtered df).
-    removed_ids: set[int] = set()
-    if unfiltered_tracks is not None and not unfiltered_tracks.empty:
-        all_ids = {int(i) for i in unfiltered_tracks["track_id"].unique()}
-        kept_ids = (
-            {int(i) for i in kept_tracks["track_id"].unique()}
-            if kept_tracks is not None and not kept_tracks.empty else set()
-        )
-        removed_ids = all_ids - kept_ids
-
-    if removed_ids:
-        # Removed segmentation = unfiltered voxels that are background in the kept
-        # (filtered) volume. The two share every kept-cell voxel exactly, so this
-        # isolates only the dropped cells. Stays lazy: napari computes one frame at
-        # a time, never the whole 4D difference at once.
-        removed_segments = None
-        if unfiltered_segments is not None:
-            removed_segments = (
-                da.where(
-                    _as_dask(kept_segments) == 0, _as_dask(unfiltered_segments), 0
-                )
-                if kept_segments is not None else unfiltered_segments
-            )
-        removed_tracks = unfiltered_tracks[
-            unfiltered_tracks["track_id"].isin(removed_ids)
-        ].reset_index(drop=True)
-        removed_graph = _subgraph(unfiltered_graph, removed_ids)
-        _add_track_set(
-            viewer, segments=removed_segments, tracks_df=removed_tracks,
-            graph=removed_graph, label="REMOVED by filter", scale=scale,
-            axis_labels=axis_labels, tail_length=tail_length, seg_opacity=0.5,
-            seg_visible=True, tracks_visible=True,
-        )
-
-    # Full pre-filter set, hidden by default (toggle on to see the before-state).
-    _add_track_set(
-        viewer, segments=unfiltered_segments, tracks_df=unfiltered_tracks,
-        graph=unfiltered_graph, label="all (before filter)", scale=scale,
-        axis_labels=axis_labels, tail_length=tail_length, seg_opacity=0.28,
-        seg_visible=False, tracks_visible=False,
-    )
-
-
-def open_in_napari(
-    *,
-    stabilized: Any,
-    stabilized_context: Any | None,
-    labels_3d: Any | None,
-    foreground: Any | None,
-    contours: Any | None,
-    tracked_segments: Any | None,
-    tracks_df: pd.DataFrame | None,
-    graph: dict[int, list[int]] | None,
-    napari_scale: tuple[float, ...],
-    axis_labels: tuple[str, ...],
-    tail_length: int,
-    title: str,
-    tracked_segments_unfiltered: Any | None = None,
-    tracks_df_unfiltered: pd.DataFrame | None = None,
-    graph_unfiltered: dict[int, list[int]] | None = None,
-) -> None:
-    """Display the stabilized volume, segmentation, and (optionally) tracks.
-
-    When an unfiltered tracks/segmentation snapshot is supplied (taken before
-    ``filter_tracks`` ran), the viewer shows the kept result, the cells/tracks
-    the filter removed, and the full pre-filter set as separate toggleable layers.
-    """
-    viewer = napari.Viewer(title=title)
-
-    def image(array: Any, **kw: Any) -> None:
+    def add_image(array: Any, layer: str, *, base_visible: bool = True, **kw: Any) -> None:
         viewer.add_image(
-            _as_dask(array), scale=napari_scale, axis_labels=axis_labels, **kw
+            _as_dask(array), name=prefix + layer, visible=False,
+            scale=scale, axis_labels=axes, metadata=meta(base_visible), **kw,
         )
 
-    def labels(array: Any, **kw: Any) -> None:
+    def add_labels(array: Any, layer: str, *, base_visible: bool = True, **kw: Any) -> None:
         viewer.add_labels(
-            _label_layer(array), scale=napari_scale, axis_labels=axis_labels, **kw
+            _label_layer(array), name=prefix + layer, visible=False,
+            scale=scale, axis_labels=axes, metadata=meta(base_visible), **kw,
         )
 
-    if stabilized_context is not None:
-        image(stabilized_context, name="stabilized context", colormap="gray")
-        image(
-            stabilized, name="stabilized track channel",
+    def add_tracks(
+        df: pd.DataFrame | None, graph: dict[int, list[int]] | None, layer: str
+    ) -> None:
+        if df is None or df.empty:
+            return
+        cols = [c for c in ("track_id", "t", "z", "y", "x") if c in df.columns]
+        viewer.add_tracks(
+            df[cols].to_numpy(), graph=graph or {}, name=prefix + layer,
+            tail_length=tail, tail_width=3, visible=False,
+            scale=scale, axis_labels=axes, metadata=meta(True),
+        )
+
+    # Raw stabilized image (plus an optional separate registration/context channel).
+    if bundle["stabilized_context"] is not None:
+        add_image(bundle["stabilized_context"], "stabilized context", colormap="gray")
+        add_image(
+            bundle["stabilized"], "stabilized track channel",
             colormap="magenta", blending="additive",
         )
     else:
-        image(stabilized, name="stabilized track channel", colormap="gray")
+        add_image(bundle["stabilized"], "stabilized track channel", colormap="gray")
 
-    if labels_3d is not None:
-        labels(
-            labels_3d, name="3D labels (Cellpose stitched)",
-            opacity=0.4, visible=tracked_segments is None,
+    # Intermediate layers (3D labels are shown only in the no-tracking seg. test).
+    if bundle["labels_3d"] is not None:
+        add_labels(
+            bundle["labels_3d"], "3D labels (Cellpose stitched)",
+            opacity=0.4, base_visible=bundle["tracked_segments"] is None,
         )
-    if foreground is not None:
-        labels(
-            foreground, name="foreground used by Ultrack",
-            opacity=0.25, visible=False,
+    if bundle["foreground"] is not None:
+        add_labels(
+            bundle["foreground"], "foreground used by Ultrack",
+            opacity=0.25, base_visible=False,
         )
-    if contours is not None:
-        image(
-            contours, name="contours used by Ultrack",
-            opacity=0.55, visible=False, blending="additive",
+    if bundle["contours"] is not None:
+        add_image(
+            bundle["contours"], "contours used by Ultrack",
+            opacity=0.55, blending="additive", base_visible=False,
         )
-    # Tracked segmentation + trajectories, split into kept / removed / all so the
-    # cells and tracks dropped by filter_tracks stay visible (and toggleable)
-    # alongside the kept result. See _add_filter_comparison_sets.
-    _add_filter_comparison_sets(
-        viewer,
-        kept_segments=tracked_segments, kept_tracks=tracks_df, kept_graph=graph,
-        unfiltered_segments=tracked_segments_unfiltered,
-        unfiltered_tracks=tracks_df_unfiltered, unfiltered_graph=graph_unfiltered,
-        scale=napari_scale, axis_labels=axis_labels, tail_length=tail_length,
-    )
-    if tracked_segments is not None and (tracks_df is None or tracks_df.empty):
-        warnings.warn("Ultrack returned no tracks; inspect the foreground layer.")
+
+    # Tracked segmentation + trajectories: KEPT (post-filter) and REMOVED only.
+    kept_seg = bundle["tracked_segments"]
+    kept_df = bundle["tracks_df"]
+    unf_seg = bundle["tracked_segments_unfiltered"]
+    unf_df = bundle["tracks_df_unfiltered"]
+
+    if kept_seg is not None:
+        add_labels(kept_seg, "segments — kept", opacity=0.28)
+    add_tracks(kept_df, bundle["graph"], "trajectories — kept")
+
+    if unf_df is not None and not unf_df.empty:
+        kept_ids = (
+            set(kept_df["track_id"].astype(int))
+            if kept_df is not None and not kept_df.empty else set()
+        )
+        removed_ids = set(unf_df["track_id"].astype(int)) - kept_ids
+        if removed_ids:
+            # Removed voxels = unfiltered cells that are background in the kept
+            # volume; stays lazy (napari computes one frame at a time).
+            if unf_seg is not None:
+                removed_seg = (
+                    da.where(_as_dask(kept_seg) == 0, _as_dask(unf_seg), 0)
+                    if kept_seg is not None else unf_seg
+                )
+                add_labels(removed_seg, "segments — REMOVED by filter", opacity=0.5)
+            removed_df = unf_df[unf_df["track_id"].isin(removed_ids)].reset_index(drop=True)
+            add_tracks(
+                removed_df, _subgraph(bundle["graph_unfiltered"], removed_ids),
+                "trajectories — REMOVED by filter",
+            )
+
+    if kept_seg is not None and (kept_df is None or kept_df.empty):
+        warnings.warn(f"{name}: Ultrack returned no tracks; inspect the foreground layer.")
+
+
+def _show_movie(viewer: Any, active: str) -> None:
+    """Make only ``active``'s layers visible, each at its own base visibility."""
+    for layer in viewer.layers:
+        movie = layer.metadata.get("movie")
+        if movie is not None:
+            layer.visible = movie == active and layer.metadata.get("base_visible", True)
+
+
+def view_movies(bundles: list[dict[str, Any]]) -> None:
+    """Open ONE napari window showing every processed movie.
+
+    All movies' layers live in a single viewer. With more than one movie a
+    "Movie" dropdown selects which movie is visible (no extra windows); with a
+    single movie the dropdown is omitted. Layers are added hidden and revealed by
+    ``_show_movie`` so each keeps its intended default visibility.
+    """
+    if not bundles:
+        return
+
+    multi = len(bundles) > 1
+    title = f"Ultrack — {len(bundles)} movies" if multi else bundles[0]["title"]
+    viewer = napari.Viewer(title=title)
+
+    for bundle in bundles:
+        name = bundle["name"]
+        _add_movie_layers(
+            viewer, name=name, prefix=f"{name}: " if multi else "", bundle=bundle,
+        )
+
+    _show_movie(viewer, bundles[0]["name"])
+
+    if multi:
+        from magicgui.widgets import ComboBox
+
+        names = [bundle["name"] for bundle in bundles]
+        switcher = ComboBox(label="Movie", choices=names, value=names[0])
+        switcher.changed.connect(lambda active: _show_movie(viewer, active))
+        viewer.window.add_dock_widget(switcher, area="left", name="Movie")
 
     napari.run()
 
@@ -1140,18 +1115,13 @@ def _resolve_time_subset(
     return lo, hi + 1
 
 
-def main() -> None:
-    czi_path = Path(CZI_PATH).expanduser().resolve()
-    if not czi_path.is_file():
-        raise FileNotFoundError(czi_path)
-    if czi_path.suffix.lower() != ".czi":
-        warnings.warn(f"Expected a .czi file, received: {czi_path.name}")
+def process_movie(czi_path: Path, *, output_dir: Path, name: str) -> dict[str, Any]:
+    """Run the full pipeline on one CZI and return its napari layer bundle.
 
-    output_dir = (
-        Path(OUTPUT_DIR).expanduser().resolve()
-        if OUTPUT_DIR is not None
-        else czi_path.with_name(f"{czi_path.stem}_ultrack")
-    )
+    ``name`` labels the movie in napari (dropdown + layer-name prefix). Every
+    output is written under ``output_dir``; nothing is displayed here -- the
+    returned bundle is handed to ``view_movies`` so all movies share one window.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     work_dir = output_dir / "ultrack_work"
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -1168,9 +1138,13 @@ def main() -> None:
     print(f"Channels: {image.channel_names}")
 
     n_channels = int(image.dims.C)
-    for name, channel in (("track", TRACK_CHANNEL), ("registration", registration_channel)):
+    # NB: the loop variable here must NOT be ``name`` -- that is this function's
+    # movie-name parameter (used for the napari "Movie" dropdown, the layer-name
+    # prefix, and the returned bundle). Letting the loop rebind it labelled every
+    # movie "registration", which silently broke multi-movie runs.
+    for role, channel in (("track", TRACK_CHANNEL), ("registration", registration_channel)):
         if not 0 <= channel < n_channels:
-            raise IndexError(f"{name} channel {channel} is outside 0..{n_channels - 1}")
+            raise IndexError(f"{role} channel {channel} is outside 0..{n_channels - 1}")
 
     track_tzyx = image.get_image_dask_data("TZYX", C=TRACK_CHANNEL)
     registration_tzyx = image.get_image_dask_data("TZYX", C=registration_channel)
@@ -1335,15 +1309,24 @@ def main() -> None:
         print("Segmentation test complete. Wrote:")
         print(f"  {stabilized_path}")
         print(f"  {labels_3d_path}")
-        open_in_napari(
-            stabilized=stabilized, stabilized_context=stabilized_context,
-            labels_3d=labels_3d, foreground=None, contours=None,
-            tracked_segments=None, tracks_df=None, graph=None,
-            napari_scale=napari_scale, axis_labels=axis_labels,
-            tail_length=TAIL_LENGTH,
-            title=f"{czi_path.name} — segmentation test (frame {start})",
-        )
-        return
+        return {
+            "name": name,
+            "title": f"{czi_path.name} — segmentation test (frame {start})",
+            "stabilized": stabilized,
+            "stabilized_context": stabilized_context,
+            "labels_3d": labels_3d,
+            "foreground": None,
+            "contours": None,
+            "tracked_segments": None,
+            "tracks_df": None,
+            "graph": None,
+            "tracked_segments_unfiltered": None,
+            "tracks_df_unfiltered": None,
+            "graph_unfiltered": None,
+            "napari_scale": napari_scale,
+            "axis_labels": axis_labels,
+            "tail_length": TAIL_LENGTH,
+        }
 
     # Convert the 3D labels to Ultrack foreground/contours. Pass disk-backed store
     # paths when the installed Ultrack accepts them (keeps large volumes off-RAM).
@@ -1456,15 +1439,103 @@ def main() -> None:
         "tracked_segments_unfiltered.zarr"
     )
 
-    open_in_napari(
-        stabilized=stabilized, stabilized_context=stabilized_context,
-        labels_3d=labels_3d, foreground=foreground, contours=contours,
-        tracked_segments=tracked_segments, tracks_df=tracks_df, graph=graph,
-        tracked_segments_unfiltered=tracked_segments_unfiltered,
-        tracks_df_unfiltered=tracks_df_unfiltered, graph_unfiltered=graph_unfiltered,
-        napari_scale=napari_scale, axis_labels=axis_labels, tail_length=TAIL_LENGTH,
-        title=f"{czi_path.name} — Ultrack neutrophils (3D){subset_label}",
+    return {
+        "name": name,
+        "title": f"{czi_path.name} — Ultrack neutrophils (3D){subset_label}",
+        "stabilized": stabilized,
+        "stabilized_context": stabilized_context,
+        "labels_3d": labels_3d,
+        "foreground": foreground,
+        "contours": contours,
+        "tracked_segments": tracked_segments,
+        "tracks_df": tracks_df,
+        "graph": graph,
+        "tracked_segments_unfiltered": tracked_segments_unfiltered,
+        "tracks_df_unfiltered": tracks_df_unfiltered,
+        "graph_unfiltered": graph_unfiltered,
+        "napari_scale": napari_scale,
+        "axis_labels": axis_labels,
+        "tail_length": TAIL_LENGTH,
+    }
+
+
+def main() -> None:
+    """Process every movie in CZI_PATHS, then show them in one napari window.
+
+    The movies are independent -- each is stabilized, segmented and tracked on its
+    own and written to its own folder -- so a failure in one must not discard the
+    others. A movie can fail for many reasons: a frame in which Cellpose segments
+    no cells (leaving Ultrack with no foreground to track), a missing or unreadable
+    file, a bad channel / TIME_SUBSET setting, a CUDA out-of-memory error, and so
+    on.
+
+    Each movie is therefore processed inside its own try/except. If it raises, the
+    error and its traceback are printed, that movie is skipped, and processing
+    continues -- so the run behaves exactly as if the failed movies had never been
+    listed in CZI_PATHS. Only the movies that succeeded are opened in napari; a
+    summary of what was skipped is printed at the end. If EVERY movie fails there
+    is nothing to display, which is reported as an error (the same situation as an
+    empty CZI_PATHS).
+
+    KeyboardInterrupt (Ctrl-C) and SystemExit are deliberately NOT caught, so the
+    whole batch can still be aborted.
+    """
+    paths = [Path(p).expanduser().resolve() for p in CZI_PATHS]
+    if not paths:
+        raise ValueError("CZI_PATHS is empty; add at least one .czi path.")
+
+    base_output = (
+        Path(OUTPUT_DIR).expanduser().resolve() if OUTPUT_DIR is not None else None
     )
+    multi = len(paths) > 1
+
+    bundles: list[dict[str, Any]] = []
+    failures: list[tuple[Path, Exception]] = []
+    for i, czi_path in enumerate(paths):
+        label = f"Movie {i + 1}/{len(paths)}: {czi_path.name}"
+        if multi:
+            print(f"\n=== {label} ===")
+        try:
+            if not czi_path.is_file():
+                raise FileNotFoundError(czi_path)
+            if czi_path.suffix.lower() != ".czi":
+                warnings.warn(f"Expected a .czi file, received: {czi_path.name}")
+
+            output_dir = (
+                base_output / czi_path.stem if base_output is not None
+                else czi_path.with_name(f"{czi_path.stem}_ultrack")
+            )
+            name = f"{i + 1}. {czi_path.stem}" if multi else czi_path.stem
+            bundles.append(process_movie(czi_path, output_dir=output_dir, name=name))
+        except Exception as exc:  # noqa: BLE001 -- isolate each movie; see docstring
+            failures.append((czi_path, exc))
+            print(
+                f"\n!!! Skipping {label}: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            traceback.print_exc()
+
+    if failures:
+        print(
+            f"\n{len(failures)} of {len(paths)} movie(s) failed and were skipped:",
+            file=sys.stderr,
+        )
+        for czi_path, exc in failures:
+            print(
+                f"  - {czi_path.name}: {type(exc).__name__}: {exc}", file=sys.stderr
+            )
+
+    if not bundles:
+        raise SystemExit(
+            f"All {len(paths)} movie(s) failed; nothing to display "
+            "(see the errors above)."
+        )
+
+    if failures:
+        print(f"\nProceeding to napari with {len(bundles)} of {len(paths)} movie(s).")
+    else:
+        print(f"\nProceeding to napari with {len(bundles)} movie(s).")
+    view_movies(bundles)
 
 
 if __name__ == "__main__":
